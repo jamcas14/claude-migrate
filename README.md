@@ -85,7 +85,17 @@ Profiles are arbitrary strings (`source`, `target`, `work`, `personal-old`, …)
 |---|---|
 | `claude-migrate status TARGET` | Local archive vs target migration counts, recent failures, recovery hints. No network. |
 | `claude-migrate doctor` | Paths, scheduler backend, captured `anthropic-*` headers, stored profiles. |
-| `claude-migrate headers-help` | Step-by-step guide to capturing `anthropic-client-version` / `anthropic-client-sha` from your browser (only needed if `/api/*` returns 400/422). |
+| `claude-migrate headers-help` | One-screen guide to capturing `anthropic-client-version` / `anthropic-client-sha` from your browser (only needed if `/api/*` returns 400/422). |
+
+### Configuration
+
+| Command | What it does |
+|---|---|
+| `claude-migrate config show` | Print the resolved config (env vars + `config.toml`). |
+| `claude-migrate config path` | Print the path to `config.toml`. |
+| `claude-migrate config edit` | Open `config.toml` in `$EDITOR` (creates a commented template if missing). |
+
+The same fields can be set via environment variables — `CLAUDE_MIGRATE_CLIENT_VERSION`, `CLAUDE_MIGRATE_CLIENT_SHA`, `CLAUDE_MIGRATE_ANONYMOUS_ID`, `CLAUDE_MIGRATE_DEVICE_ID`, `CLAUDE_MIGRATE_CHAT_SLEEP_SEC`. Env vars override `config.toml`.
 
 ### Memory
 
@@ -237,7 +247,7 @@ When `sessionKey` eventually expires, the timer fires, hits 401, exits 75, and w
 | `auth says "Cloudflare is challenging the request"` | Stale `cf_clearance` | Refresh `claude.ai` in your browser, then `claude-migrate login <profile>` and re-paste |
 | `auth says "TLS fingerprint reject"` | curl_cffi out of date | `pip install -U curl_cffi`, retry |
 | Restore is hitting 429 every chat | Per-account rate limit on `/completion` | Default 90s/chat keeps most accounts under the limit. Override: `export CLAUDE_MIGRATE_CHAT_SLEEP_SEC=120`. The CLI auto-cools-down on 429 (capped exponential up to 600s). |
-| `migrate` fails with HTTP 400/422 | `anthropic-client-sha` rotated | Run `claude-migrate headers-help`, capture the new value, re-run |
+| `migrate` fails with HTTP 400/422 | `anthropic-client-sha` rotated | `claude-migrate headers-help` for the capture walkthrough; `claude-migrate config edit` to put the new values in `config.toml` |
 | Restore was interrupted; what's left? | — | `claude-migrate status target` reads `migration_log` (no network) and prints done/total per object type plus recent failures |
 | Failed restore left empty conversations on target | Worker died mid-flight | Find the timestamp of the failed run, then `claude-migrate cleanup target --since 2026-04-30T14:37 --execute`. Each candidate is verified to have zero messages before deletion. |
 | Recents on target are in wrong order | Concurrency > 1 scrambled the migration order | `claude-migrate reorder target --execute` walks source archive in `updated_at ASC` order and bumps each chat's `updated_at` on target |

@@ -12,6 +12,7 @@ import asyncio
 import logging
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 import click
 import structlog
@@ -77,46 +78,46 @@ TOS_BANNER = (
 )
 
 CLIENT_VERSION_HELP = """\
-claude.ai's web app sends a few `anthropic-*` headers on every /api/* request
-that act as a build/identity fingerprint. When stale or missing, Cloudflare or
-Anthropic's backend can reject requests with HTTP 400/422. The header that
-matters most in practice is `anthropic-client-sha` — it rotates every few
-weeks as Anthropic ships new builds.
+Only needed if /api/* returns HTTP 400 or 422. claude.ai sends a few
+`anthropic-*` request headers as a build fingerprint that rotates every few
+weeks; when stale, the API rejects.
 
-Most users never need to set these. Capture and configure them only if you hit
-400/422 errors. Step-by-step:
+Capture them once from your browser:
 
-  1. Open https://claude.ai (signed in) and press F12 to open DevTools.
-  2. Click the Network tab.
-  3. Refresh the page (or click around the UI) so requests appear in the list.
-  4. Click any request whose path starts with /api/ — for example
-     /api/bootstrap or /api/organizations/<uuid>/chat_conversations.
-  5. In the right-side Headers panel, scroll to "Request Headers" and find:
-       anthropic-client-version    (e.g. 1.0.0)
-       anthropic-client-sha         (40-char hex like efac08e6...) — most important
-       anthropic-anonymous-id       (claudeai.v1.<uuid>) — optional
-       anthropic-device-id          (<uuid>)              — optional
-     Copy each value.
+  1. Open https://claude.ai (signed in) → F12 → Network tab.
+  2. Click any /api/* request → right-side "Request Headers" → copy:
+       anthropic-client-version  (e.g. "1.0.0")
+       anthropic-client-sha      (40-char hex; rotates most often)
+       anthropic-anonymous-id    (optional, claudeai.v1.<uuid>)
+       anthropic-device-id       (optional, <uuid>)
 
-Then set them one of two ways:
+Set them via either:
+  • `claude-migrate config edit` — opens config.toml in your $EDITOR
+  • environment variables: CLAUDE_MIGRATE_CLIENT_VERSION,
+    CLAUDE_MIGRATE_CLIENT_SHA, CLAUDE_MIGRATE_ANONYMOUS_ID,
+    CLAUDE_MIGRATE_DEVICE_ID
 
-  # session-only
-  export CLAUDE_MIGRATE_CLIENT_VERSION=1.0.0
-  export CLAUDE_MIGRATE_CLIENT_SHA=<paste>
-  export CLAUDE_MIGRATE_ANONYMOUS_ID=<paste>     # optional
-  export CLAUDE_MIGRATE_DEVICE_ID=<paste>        # optional
+Verify with `claude-migrate doctor`, then re-run the failed command.
+See the README for screenshots of the DevTools steps.
+"""
 
-  # persistent — append to ~/.config/claude-migrate/config.toml:
-  mkdir -p ~/.config/claude-migrate
-  cat >> ~/.config/claude-migrate/config.toml <<EOF
-  client_version = "1.0.0"
-  client_sha = "<paste>"
-  anonymous_id = "<paste>"   # optional
-  device_id = "<paste>"      # optional
-  EOF
+CONFIG_TEMPLATE = """\
+# claude-migrate configuration
+#
+# All fields are optional. Set the `anthropic-*` headers below ONLY if you hit
+# HTTP 400/422 from /api/* — the headers rotate every few weeks. Capture from
+# DevTools → Network → any /api/* request → Request Headers.
+#
+# Run `claude-migrate headers-help` for the capture walkthrough.
 
-Verify with `claude-migrate doctor`. Re-run the failed command afterward —
-work resumes from the last checkpoint.
+# client_version = "1.0.0"
+# client_sha     = ""    # 40-char hex, anthropic-client-sha — most important
+# anonymous_id   = ""    # optional, anthropic-anonymous-id (claudeai.v1.<uuid>)
+# device_id      = ""    # optional, anthropic-device-id
+
+# Per-chat sleep during restore. Default 90s keeps most accounts under the
+# /completion rate limit. Lower values are faster but more likely to 429.
+# chat_sleep_sec = 90.0
 """
 
 
@@ -783,10 +784,60 @@ def doctor() -> None:
 
 
 @cli.command("headers-help",
-             help="Show how to capture the anthropic-* request headers from your "
-             "browser (only needed if /api/* returns 400/422).")
+             help="How to capture anthropic-* headers from your browser "
+             "(only needed if /api/* returns 400/422).")
 def headers_help() -> None:
-    click.echo(CLIENT_VERSION_HELP, err=True)
+    click.echo(CLIENT_VERSION_HELP)
+
+
+# ---------------------------------------------------------------------------
+# Config (open config.toml in $EDITOR; show resolved settings)
+# ---------------------------------------------------------------------------
+
+
+def _config_path() -> Path:
+    return Path(config_dir()) / "config.toml"
+
+
+@cli.group(help="Manage the config.toml file (anthropic-* headers, chat sleep, etc.).")
+def config() -> None:
+    pass
+
+
+@config.command("path", help="Print the path to config.toml.")
+def config_path_cmd() -> None:
+    click.echo(str(_config_path()))
+
+
+@config.command("show", help="Print the resolved config (env vars + config.toml).")
+def config_show() -> None:
+    settings = load_settings()
+    click.echo(f"  client_version: {settings.client_version!r}")
+    click.echo(f"  client_sha:     {settings.client_sha!r}")
+    click.echo(f"  anonymous_id:   {settings.anonymous_id!r}")
+    click.echo(f"  device_id:      {settings.device_id!r}")
+    click.echo(f"  chat_sleep_sec: {settings.chat_sleep_sec}")
+    click.echo(f"  base_url:       {settings.base_url}")
+    click.echo("")
+    p = _config_path()
+    if p.exists():
+        click.echo(f"  config file:    {p}")
+    else:
+        click.echo(f"  config file:    {p}  (not yet created — run `config edit` to create)")
+
+
+@config.command("edit", help="Open config.toml in $EDITOR (creates it with a template if missing).")
+def config_edit() -> None:
+    """Creates `~/.config/claude-migrate/config.toml` with a commented template
+    on first run, then opens it in `$EDITOR` (or `$VISUAL`, falling back to a
+    sensible per-OS default). Use this after `headers-help` to set the
+    anthropic-* headers when /api/* is returning 400/422."""
+    p = _config_path()
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(CONFIG_TEMPLATE, "utf-8")
+        click.echo(f"Created template: {p}")
+    click.edit(filename=str(p))
 
 
 @cli.command(help="Print extraction prompt + claude.com/import-memory instructions.")

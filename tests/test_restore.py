@@ -234,6 +234,40 @@ def test_rename_no_op_when_old_and_new_match() -> None:
     assert "nothing to do" in result.output
 
 
+def test_config_path_prints_a_path() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["config", "path"])
+    assert result.exit_code == 0
+    assert result.output.strip().endswith("config.toml")
+
+
+def test_config_show_prints_resolved_settings() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["config", "show"])
+    assert result.exit_code == 0
+    for key in ("client_version", "client_sha", "anonymous_id", "device_id",
+                "chat_sleep_sec", "base_url", "config file"):
+        assert key in result.output
+
+
+def test_config_help_lists_subcommands() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["config", "--help"])
+    assert result.exit_code == 0
+    for sub in ("edit", "path", "show"):
+        assert sub in result.output
+
+
+def test_headers_help_is_short_and_points_at_config_edit() -> None:
+    """Trimmed from ~30 lines to a concise summary that points at `config edit`."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["headers-help"])
+    assert result.exit_code == 0
+    # Sanity-check the trim — full output should be well under 30 lines.
+    assert result.output.count("\n") < 30
+    assert "config edit" in result.output
+
+
 def test_dry_run_plan_counts_pending(db_conn: sqlite3.Connection) -> None:
     upsert_project(db_conn, "o1", {"uuid": "p1", "name": "First"})
     upsert_project(db_conn, "o1", {"uuid": "p2", "name": "Second"})

@@ -407,8 +407,6 @@ Authenticating profile {target}. You'll paste two cookies from your browser
   3. Copy the full Value for `sessionKey` and `cf_clearance`.
      The displayed Value column truncates — click the row to see the full
      value in the details panel and copy from there.
-
-(See the README for screenshots and per-browser troubleshooting.)
 """
 
 
