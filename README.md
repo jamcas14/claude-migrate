@@ -61,9 +61,10 @@ Profiles are arbitrary strings (`source`, `target`, `work`, `personal-old`, …)
 
 | Command | What it does |
 |---|---|
-| `claude-migrate login NAME` | Walks you through pasting `sessionKey` and `cf_clearance` from DevTools. Idempotent — running against an existing name overwrites the stored cookies. |
+| `claude-migrate login NAME` | Walks you through pasting `sessionKey` and `cf_clearance` from DevTools. Idempotent — running against an existing name overwrites the stored cookies (use this to refresh after expiry). |
 | `claude-migrate logout NAME` | Removes the profile from the keychain. |
-| `claude-migrate accounts` | Lists stored profiles + their last-known identity. No network. |
+| `claude-migrate rename OLD NEW` | Renames a stored profile (typo fix or naming change). Pure metadata — no re-paste, no network call. |
+| `claude-migrate accounts` | Lists stored profiles + their last-known identity. No network. Prints management hints for `login`/`rename`/`logout`/`whoami`. |
 | `claude-migrate whoami NAME` | Probes the profile against `/api/bootstrap`, prints the live identity, updates the stored `last_probe_ok` timestamp. |
 
 ### Migration
@@ -133,41 +134,75 @@ claude-migrate schedule install
 
 ## Auth walkthrough
 
-`login` walks you through pasting two cookies from DevTools. Anthropic marks `sessionKey` as `HttpOnly`, so the JS console can't see it — you need DevTools' Application/Storage tab. The prompt itself shows the exact steps for Chromium-based browsers (Chrome, Edge, Brave, Arc, Opera, Vivaldi), Firefox, and Safari. About 30 seconds.
+`login` walks you through pasting two cookies from DevTools. Anthropic marks `sessionKey` as `HttpOnly`, so the JS console can't see it — you need DevTools' Application/Storage tab. About 30 seconds per profile.
+
+### The two cookies
+
+| Name | Where | Looks like |
+|---|---|---|
+| `sessionKey` | DevTools → Application/Storage → Cookies → `https://claude.ai` | `sk-ant-sid01-…` (or `sid02-`, etc.) — ~120 chars |
+| `cf_clearance` | same table | longer alphanumeric — ~50+ chars |
+
+> The Value column in DevTools usually truncates the displayed string. **Click the row** and look at the details panel below the table for the full value, then copy from there. This is the single most common cause of "looks too short" errors.
+
+### Per-browser steps
+
+| Browser | DevTools cookie viewer |
+|---|---|
+| Chrome / Edge / Brave / Arc / Opera / Vivaldi | F12 → **Application** tab → Storage → Cookies → `https://claude.ai` |
+| Firefox | F12 → **Storage** tab → Cookies → `https://claude.ai` |
+| Safari | Enable: Safari → Settings → Advanced → "Show Develop menu". Then Develop → Show Web Inspector → Storage → Cookies → `claude.ai` |
+
+### What the CLI shows
 
 ```
 $ claude-migrate login source
 
-To authenticate, you'll paste two cookies from your browser.
-This takes about 30 seconds and you only do it once per account.
+Authenticating profile source. You'll paste two cookies from your browser
+(~30 seconds, once per account).
 
-────────────────────────────────────────────────────────────────
-Step 1 — Open https://claude.ai signed in to the SOURCE account.
-Step 2 — Press F12 to open DevTools.
-Step 3 — Find the cookies viewer:
-         ▸ Chromium browsers: "Application" tab → Cookies → claude.ai
-         ▸ Firefox:           "Storage" tab → Cookies → claude.ai
-         ▸ Safari:            Develop → Show Web Inspector → Storage → Cookies → claude.ai
-Step 4 — Find the row named `sessionKey`. The Value column is often
-         truncated! Click the row, then look at the panel below to
-         see the full value. Triple-click and copy.
+  1. Open https://claude.ai signed in to the source account.
+  2. Press F12, then go to:
+       Chromium browsers:  Application tab → Cookies → claude.ai
+       Firefox:            Storage tab → Cookies → claude.ai
+       Safari:             Develop → Show Web Inspector → Storage → Cookies → claude.ai
+  3. Copy the full Value for `sessionKey` and `cf_clearance`.
 
-Paste the value of `sessionKey` (starts with `sk-ant-sid<NN>-`):
+sessionKey (starts with sk-ant-sid01- or sk-ant-sid02-, ~120 chars):
 > sk-ant-sid01-…
-✓ format OK
+  ✓ sessionKey format OK
 
-Paste cf_clearance:
+cf_clearance:
 > Zk0c.W3.…
-✓ format OK
+  ✓ cf_clearance format OK
 
-Probing claude.ai/api/bootstrap to confirm credentials...
-  ✓ Authenticated as: foo@example.com
-  ✓ Organization:     Foo's Workspace (uuid: a1b2c3d4-…)
+Confirming credentials with claude.ai...
+  ✓ Authenticated as foo@example.com (Foo's Workspace)
+    Stored as profile 'source' in the OS keychain.
 
-Stored as profile: source.
+  → `claude-migrate whoami source`   live-probe this profile later
+  → `claude-migrate login source`    re-paste cookies after expiry
 ```
 
-The CLI silently strips common copy-paste mistakes (surrounding quotes, `sessionKey:` / `name=value` prefixes, trailing semicolons, URL-encoded characters) and validates format before any network call. Failure modes have specific recovery messages — `401` → re-copy sessionKey, `403` + Cloudflare HTML → refresh `claude.ai` once and re-paste cf_clearance only, etc.
+### Common copy-paste mistakes (silently fixed)
+
+The CLI strips these before format validation, so you don't have to think about them:
+
+- Surrounding quotes (`"sk-ant-…"`)
+- `sessionKey:` or `sessionKey=` prefixes (from copying header lines)
+- Trailing semicolon (from a `Cookie:` header copy)
+- URL-encoded characters (`%2B` → `+`)
+- `Bearer ` prefix
+- Leading/trailing whitespace and newlines
+
+### Failure modes (each has a specific recovery message)
+
+| HTTP | Message | Fix |
+|---|---|---|
+| `401` | "Your sessionKey was not accepted (HTTP 401)…" | Re-copy `sessionKey` (most common cause: truncation) |
+| `403` + Cloudflare HTML | "Cloudflare is challenging the request…" | Refresh `claude.ai` once in your browser to get a fresh `cf_clearance`, re-paste cf_clearance only |
+| `403` no body | "Cloudflare blocked the TLS fingerprint…" | `pip install -U curl_cffi` and retry |
+| network | "Network error while probing claude.ai…" | Check VPN/proxy/connection |
 
 ---
 

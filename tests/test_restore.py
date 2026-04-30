@@ -169,6 +169,71 @@ def test_accounts_with_no_profiles_shows_login_hint() -> None:
     assert "claude-migrate login" in result.output
 
 
+def test_accounts_with_profiles_shows_management_hints() -> None:
+    """The non-empty `accounts` output should advertise login/rename/logout/whoami
+    so users discover the profile-management verbs without reading --help."""
+    from claude_migrate import cli as cli_mod
+    from claude_migrate.auth import Profile
+
+    real_list = cli_mod.list_profiles
+    real_load = cli_mod.load_profile
+    cli_mod.list_profiles = lambda: ["work"]  # type: ignore[assignment]
+    cli_mod.load_profile = lambda name: Profile(  # type: ignore[assignment]
+        session_key="x", cf_clearance="y",
+        email="user@example.com", last_probe_ok="2026-01-01",
+    )
+    try:
+        runner = CliRunner()
+        result = runner.invoke(cli, ["accounts"])
+    finally:
+        cli_mod.list_profiles = real_list  # type: ignore[assignment]
+        cli_mod.load_profile = real_load  # type: ignore[assignment]
+    assert result.exit_code == 0
+    assert "user@example.com" in result.output
+    for hint in ("claude-migrate login", "claude-migrate rename",
+                 "claude-migrate logout", "claude-migrate whoami"):
+        assert hint in result.output, f"{hint!r} missing from accounts output"
+
+
+def test_rename_help_lists_old_and_new_args() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["rename", "--help"])
+    assert result.exit_code == 0
+    assert "OLD_NAME NEW_NAME" in result.output
+    assert "no network call" in result.output
+
+
+def test_rename_refuses_when_destination_already_exists() -> None:
+    """If a profile under NEW_NAME already exists, refuse rather than clobber it."""
+    from claude_migrate import cli as cli_mod
+    from claude_migrate.auth import Profile
+    from claude_migrate.errors import AuthMissing
+
+    profile = Profile(session_key="x", cf_clearance="y", email="a@b.com")
+
+    def fake_load(name: str) -> Profile:
+        if name in ("source", "target"):
+            return profile
+        raise AuthMissing(f"No profile named {name!r}")
+
+    real_load = cli_mod.load_profile
+    cli_mod.load_profile = fake_load  # type: ignore[assignment]
+    try:
+        runner = CliRunner()
+        result = runner.invoke(cli, ["rename", "source", "target"])
+    finally:
+        cli_mod.load_profile = real_load  # type: ignore[assignment]
+    assert result.exit_code != 0
+    assert "already exists" in result.output
+
+
+def test_rename_no_op_when_old_and_new_match() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["rename", "samename", "samename"])
+    assert result.exit_code == 0
+    assert "nothing to do" in result.output
+
+
 def test_dry_run_plan_counts_pending(db_conn: sqlite3.Connection) -> None:
     upsert_project(db_conn, "o1", {"uuid": "p1", "name": "First"})
     upsert_project(db_conn, "o1", {"uuid": "p2", "name": "Second"})

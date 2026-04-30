@@ -395,62 +395,50 @@ def _prompt_with_retries(
 
 
 SOURCE_INSTRUCTIONS = """\
-To authenticate, you'll paste two cookies from your browser.
-This takes about 30 seconds and you only do it once per account.
+Authenticating profile {target}. You'll paste two cookies from your browser
+(~30 seconds, once per account).
 
-────────────────────────────────────────────────────────────────
-Step 1 — Open https://claude.ai in your browser, signed in to the
-         {target} account. Use a normal window (not incognito/private).
+  1. Open https://claude.ai signed in to the {target} account.
+  2. Press F12, then go to:
+       Chromium browsers:  Application tab → Cookies → claude.ai
+       Firefox:            Storage tab → Cookies → claude.ai
+       Safari:             Develop → Show Web Inspector → Storage → Cookies → claude.ai
+                           (enable Develop menu first in Safari → Settings → Advanced)
+  3. Copy the full Value for `sessionKey` and `cf_clearance`.
+     The displayed Value column truncates — click the row to see the full
+     value in the details panel and copy from there.
 
-Step 2 — Open DevTools by pressing F12, or:
-           macOS:    Cmd+Option+I
-           Right-click anywhere → "Inspect" / "Inspect Element"
-
-Step 3 — Find the cookies viewer:
-         Chrome / Edge / Brave / Opera / Vivaldi / Arc:
-             "Application" tab → Storage → Cookies → https://claude.ai
-         Firefox:
-             "Storage" tab → Cookies → https://claude.ai
-         Safari:
-             First enable Develop menu: Safari → Settings → Advanced →
-             check "Show Develop menu in menu bar"
-             Then: Develop → Show Web Inspector → Storage → Cookies → claude.ai
-
-Step 4 — In the cookie table, find the row named `sessionKey`.
-         The Value column is often truncated! Click the row,
-         then look at the panel below or beside the table for the
-         FULL value. Triple-click or Ctrl+A inside that field to
-         select the entire string, then copy.
+(See the README for screenshots and per-browser troubleshooting.)
 """
 
 
 async def run_auth_flow(profile_name: str, *, refreshing: bool = False) -> Profile:
-    """The interactive paste flow per Section 7.1."""
+    """Interactive cookie paste flow."""
     settings = load_settings()
-    print(SOURCE_INSTRUCTIONS.format(target=profile_name.upper()))
-    print("Paste the value of `sessionKey` (starts with `sk-ant-sid<NN>-`, e.g. sk-ant-sid01- or sk-ant-sid02-):")
+    print(SOURCE_INSTRUCTIONS.format(target=profile_name))
+    print("sessionKey (starts with sk-ant-sid01- or sk-ant-sid02-, ~120 chars):")
     sk = _prompt_with_retries(
         "",
         validate_session_key,
         extra_help=(
-            "If the Value column is truncated, click the row in DevTools and copy from "
-            "the details panel below the table."
+            "If the Value column is truncated, click the row in DevTools and copy "
+            "from the details panel below the table."
         ),
     )
-    print("Validating sessionKey... ✓ format OK\n")
-    print("Now find the cookie named `cf_clearance` and copy its value the same way.")
-    print("Paste cf_clearance:")
+    print("  ✓ sessionKey format OK")
+    print("\ncf_clearance:")
     cf = _prompt_with_retries(
         "",
         validate_cf_clearance,
         extra_help=(
-            "cf_clearance is a separate row in the same cookie table. If you don't see it, "
-            "refresh https://claude.ai once in your browser to provoke a fresh challenge."
+            "cf_clearance is a separate row in the same cookie table. If you don't "
+            "see it, refresh https://claude.ai once in your browser to provoke a "
+            "fresh challenge."
         ),
     )
-    print("Validating cf_clearance... ✓ format OK\n")
+    print("  ✓ cf_clearance format OK\n")
 
-    print("Probing claude.ai/api/bootstrap to confirm credentials...")
+    print("Confirming credentials with claude.ai...")
     creds = Credentials(session_key=sk, cf_clearance=cf)
     try:
         result = await probe(creds, settings)
@@ -478,10 +466,6 @@ async def run_auth_flow(profile_name: str, *, refreshing: bool = False) -> Profi
             "VPN, or proxy settings."
         ) from e
 
-    print("  ✓ Connection OK")
-    print(f"  ✓ Authenticated as: {result.email}")
-    print(f"  ✓ Organization: {result.org_name} (uuid: {result.org_uuid})")
-    print()
     profile = Profile(
         session_key=sk,
         cf_clearance=cf,
@@ -490,18 +474,17 @@ async def run_auth_flow(profile_name: str, *, refreshing: bool = False) -> Profi
         stored_at=_now_iso(),
         last_probe_ok=_now_iso(),
     )
-    print(f"Storing in OS keychain as `{KEYRING_SERVICE}:{profile_name}`... ", end="")
     store_profile(profile_name, profile)
-    print("✓")
     verb = "Refreshed" if refreshing else "Authenticated"
-    print()
-    print(f"  ✓ {verb} as: {result.email}")
+    print(f"  ✓ {verb} as {result.email}", end="")
     if result.org_name:
-        print(f"    Organization: {result.org_name}")
-    print(f"    Stored as profile: {profile_name}")
+        print(f" ({result.org_name})")
+    else:
+        print()
+    print(f"    Stored as profile {profile_name!r} in the OS keychain.")
     print()
-    print(f"  → To verify later:        claude-migrate auth verify {profile_name}")
-    print(f"  → To re-authenticate:     claude-migrate auth refresh {profile_name}")
+    print(f"  → `claude-migrate whoami {profile_name}`   live-probe this profile later")
+    print(f"  → `claude-migrate login {profile_name}`    re-paste cookies after expiry")
     return profile
 
 

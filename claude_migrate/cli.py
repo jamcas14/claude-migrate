@@ -246,7 +246,7 @@ def accounts() -> None:
     names = list_profiles()
     if not names:
         click.echo("No profiles stored.")
-        click.echo("Run `claude-migrate login <name>` to authenticate one.")
+        click.echo("  → `claude-migrate login <name>` to authenticate one.")
         return
     width = max(len("PROFILE"), max(len(n) for n in names))
     click.echo(f"  {'PROFILE':<{width}}  EMAIL                            LAST PROBE")
@@ -258,6 +258,35 @@ def accounts() -> None:
             click.echo(f"  {n:<{width}}  {email:<32} {probe}")
         except AuthError as e:
             click.echo(f"  {n:<{width}}  (error: {e})")
+    click.echo("")
+    click.echo("  → `claude-migrate login <name>`         re-paste cookies (refresh expired session)")
+    click.echo("  → `claude-migrate rename OLD NEW`       rename a profile")
+    click.echo("  → `claude-migrate logout <name>`        remove a profile from the keychain")
+    click.echo("  → `claude-migrate whoami <name>`        live-probe a profile's credentials")
+
+
+@cli.command(help="Rename a stored profile (no network call, no re-paste needed).")
+@click.argument("old_name")
+@click.argument("new_name")
+def rename(old_name: str, new_name: str) -> None:
+    """Local metadata operation. Useful for typo fixes (`source` → `soource`)
+    or naming changes (`work` → `work-old`). The cookies and the discovered
+    org/email move under the new name; the OLD name is removed."""
+    if old_name == new_name:
+        click.echo(f"Source and destination are both {old_name!r}; nothing to do.")
+        return
+    profile = load_profile(old_name)  # raises AuthMissing if not found
+    if _profile_exists(new_name):
+        click.echo(
+            f"A profile named {new_name!r} already exists. Run "
+            f"`claude-migrate logout {new_name}` first if you want to overwrite it.",
+            err=True,
+        )
+        sys.exit(2)
+    from .auth import store_profile  # local to keep top-level imports tight
+    store_profile(new_name, profile)
+    remove_profile(old_name)
+    click.echo(f"Renamed {old_name!r} → {new_name!r}.")
 
 
 @cli.command(help="Probe a profile to confirm its credentials still work.")
@@ -427,8 +456,20 @@ def migrate(
         click.echo("\n(dry-run — pass --execute to migrate)")
         return
 
-    # Step 3: execute
-    click.echo(f"\nStep 3/3: migrating to target ({target})")
+    # Probe target identity before any destructive call so the user can catch a
+    # "wrong cookies on the target profile" mistake before we mutate.
+    async def _confirm_target() -> tuple[str | None, str | None]:
+        async with open_session(target) as session:
+            return session.email, session.org_name
+
+    confirmation = _run(_confirm_target())
+    if isinstance(confirmation, tuple):
+        email, org_name = confirmation
+        click.echo(f"\nStep 3/3: migrating to target ({target})")
+        click.echo(f"  ✓ {email or '?'}{f' ({org_name})' if org_name else ''}")
+    else:
+        click.echo(f"\nStep 3/3: migrating to target ({target})")
+
     summary = _run(run_restore(
         target_profile=target,
         dry_run=False,
