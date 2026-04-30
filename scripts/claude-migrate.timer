@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily claude-migrate dump
+Description=Daily claude-migrate backup
 
 [Timer]
 OnCalendar=daily

@@ -243,9 +243,9 @@ When `sessionKey` eventually expires, the timer fires, hits 401, exits 75, and w
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `auth says "looks too short"` | DevTools Value column truncates the display | Click the row, copy from the details panel below the table |
-| `auth says "Cloudflare is challenging the request"` | Stale `cf_clearance` | Refresh `claude.ai` in your browser, then `claude-migrate login <profile>` and re-paste |
-| `auth says "TLS fingerprint reject"` | curl_cffi out of date | `pip install -U curl_cffi`, retry |
+| `login` says "looks too short" | DevTools Value column truncates the display | Click the row, copy from the details panel below the table |
+| `login` says "Cloudflare is challenging the request" | Stale `cf_clearance` | Refresh `claude.ai` in your browser, then `claude-migrate login <profile>` and re-paste |
+| `login` says "TLS fingerprint reject" | curl_cffi out of date | `pip install -U curl_cffi`, retry |
 | Restore is hitting 429 every chat | Per-account rate limit on `/completion` | Default 90s/chat keeps most accounts under the limit. Override: `export CLAUDE_MIGRATE_CHAT_SLEEP_SEC=120`. The CLI auto-cools-down on 429 (capped exponential up to 600s). |
 | `migrate` fails with HTTP 400/422 | `anthropic-client-sha` rotated | `claude-migrate headers-help` for the capture walkthrough; `claude-migrate config edit` to put the new values in `config.toml` |
 | Restore was interrupted; what's left? | — | `claude-migrate status target` reads `migration_log` (no network) and prints done/total per object type plus recent failures |

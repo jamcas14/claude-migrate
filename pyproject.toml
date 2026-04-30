@@ -36,9 +36,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YOUR-USER/claude-migrate"
-Repository = "https://github.com/YOUR-USER/claude-migrate"
-Issues = "https://github.com/YOUR-USER/claude-migrate/issues"
+# After creating the GitHub repository, replace `your-username` below with your handle.
+Homepage = "https://github.com/your-username/claude-migrate"
+Repository = "https://github.com/your-username/claude-migrate"
+Issues = "https://github.com/your-username/claude-migrate/issues"
 
 [project.optional-dependencies]
 dev = [

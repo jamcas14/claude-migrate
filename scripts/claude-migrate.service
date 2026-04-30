@@ -1,13 +1,14 @@
 [Unit]
-Description=Daily incremental dump of Claude.ai accounts
+Description=Daily incremental backup of a Claude.ai profile
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/claude-migrate dump --incremental --quiet
-StandardOutput=append:%h/.local/state/claude-migrate/dump.log
-StandardError=append:%h/.local/state/claude-migrate/dump.log
+# Replace `source` with your profile name from `claude-migrate accounts`.
+ExecStart=/usr/local/bin/claude-migrate --quiet backup source
+StandardOutput=append:%h/.local/state/claude-migrate/backup.log
+StandardError=append:%h/.local/state/claude-migrate/backup.log
 
 [Install]
 WantedBy=default.target

@@ -863,9 +863,12 @@ def schedule() -> None:
 
 
 @schedule.command("install", help="Install the daily incremental backup timer.")
-def schedule_install() -> None:
-    s = install_timer()
+@click.option("--profile", default="source", show_default=True,
+              help="Profile to back up daily.")
+def schedule_install(profile: str) -> None:
+    s = install_timer(profile)
     click.echo(f"  backend:   {s.backend}")
+    click.echo(f"  profile:   {profile}")
     click.echo(f"  installed: {s.installed}")
     if s.detail:
         click.echo(f"  detail:    {s.detail}")

@@ -1,11 +1,10 @@
-"""Install per-OS daily timer that runs `claude-migrate dump --incremental`."""
+"""Install per-OS daily timer that runs `claude-migrate backup <profile>`."""
 
 from __future__ import annotations
 
 import contextlib
 import getpass
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -16,6 +15,7 @@ from .config import data_dir
 
 UNIT_NAME = "claude-migrate"
 LAUNCHD_LABEL = "com.user.claudemigrate"
+DEFAULT_PROFILE = "source"
 
 
 @dataclass
@@ -50,7 +50,7 @@ def _systemd_dir() -> Path:
     return Path.home() / ".config" / "systemd" / "user"
 
 
-def _systemd_install() -> TimerStatus:
+def _systemd_install(profile: str) -> TimerStatus:
     udir = _systemd_dir()
     udir.mkdir(parents=True, exist_ok=True)
     exe = _claude_migrate_path()
@@ -58,19 +58,19 @@ def _systemd_install() -> TimerStatus:
     log_dir.mkdir(parents=True, exist_ok=True)
     service = (
         "[Unit]\n"
-        "Description=Daily incremental dump of Claude.ai accounts\n"
+        f"Description=Daily incremental backup of profile {profile!r}\n"
         "Wants=network-online.target\n"
         "After=network-online.target\n\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"ExecStart={exe} dump --incremental --quiet\n"
+        f"ExecStart={exe} --quiet backup {profile}\n"
         f"WorkingDirectory={data_dir().parent}\n"
-        f"StandardOutput=append:{log_dir}/dump.log\n"
-        f"StandardError=append:{log_dir}/dump.log\n"
+        f"StandardOutput=append:{log_dir}/backup.log\n"
+        f"StandardError=append:{log_dir}/backup.log\n"
     )
     timer = (
         "[Unit]\n"
-        "Description=Daily incremental claude-migrate dump\n\n"
+        f"Description=Daily claude-migrate backup of profile {profile!r}\n\n"
         "[Timer]\n"
         "OnCalendar=daily\n"
         "Persistent=true\n"
@@ -114,12 +114,14 @@ def _launchd_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 
-def _launchd_install() -> TimerStatus:
+def _launchd_install(profile: str) -> TimerStatus:
     p = _launchd_plist_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     exe = _claude_migrate_path()
     log_dir = data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    args = [*exe.split(), "--quiet", "backup", profile]
+    program_args = "".join(f"<string>{a}</string>" for a in args)
     plist = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -127,11 +129,11 @@ def _launchd_install() -> TimerStatus:
         '<plist version="1.0">\n<dict>\n'
         f'  <key>Label</key><string>{LAUNCHD_LABEL}</string>\n'
         '  <key>ProgramArguments</key>\n'
-        f'  <array>{"".join(f"<string>{a}</string>" for a in [*exe.split(), "dump", "--incremental", "--quiet"])}</array>\n'
+        f'  <array>{program_args}</array>\n'
         '  <key>StartCalendarInterval</key>\n'
         '  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>17</integer></dict>\n'
-        f'  <key>StandardOutPath</key><string>{log_dir}/dump.log</string>\n'
-        f'  <key>StandardErrorPath</key><string>{log_dir}/dump.log</string>\n'
+        f'  <key>StandardOutPath</key><string>{log_dir}/backup.log</string>\n'
+        f'  <key>StandardErrorPath</key><string>{log_dir}/backup.log</string>\n'
         '  <key>RunAtLoad</key><false/>\n'
         '</dict>\n</plist>\n'
     )
@@ -154,11 +156,11 @@ def _launchd_status() -> TimerStatus:
     return TimerStatus(installed=p.exists(), backend="launchd", detail=str(p))
 
 
-def _task_scheduler_install() -> TimerStatus:
+def _task_scheduler_install(profile: str) -> TimerStatus:
     exe = _claude_migrate_path()
     cmd = [
         "schtasks", "/Create", "/SC", "DAILY", "/TN", "claude-migrate",
-        "/TR", f'"{exe}" dump --incremental --quiet',
+        "/TR", f'"{exe}" --quiet backup {profile}',
         "/ST", "04:17", "/F",
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -193,16 +195,16 @@ def _task_scheduler_status() -> TimerStatus:
     )
 
 
-def install_timer() -> TimerStatus:
+def install_timer(profile: str = DEFAULT_PROFILE) -> TimerStatus:
     backend = detect_backend()
     if backend == "systemd":
-        return _systemd_install()
+        return _systemd_install(profile)
     if backend == "launchd":
-        return _launchd_install()
+        return _launchd_install(profile)
     if backend == "task_scheduler":
-        return _task_scheduler_install()
+        return _task_scheduler_install(profile)
     if backend == "cron":
-        return _cron_install()
+        return _cron_install(profile)
     return TimerStatus(installed=False, backend=backend, detail="No supported scheduler found.")
 
 
@@ -237,9 +239,9 @@ def timer_status() -> TimerStatus:
 CRON_TAG = "# claude-migrate (managed)"
 
 
-def _cron_install() -> TimerStatus:
+def _cron_install(profile: str) -> TimerStatus:
     exe = _claude_migrate_path()
-    line = f"17 4 * * * {exe} dump --incremental --quiet  {CRON_TAG}\n"
+    line = f"17 4 * * * {exe} --quiet backup {profile}  {CRON_TAG}\n"
     existing = subprocess.run(
         ["crontab", "-l"], capture_output=True, text=True, check=False
     ).stdout
@@ -250,7 +252,7 @@ def _cron_install() -> TimerStatus:
     )
     return TimerStatus(
         installed=proc.returncode == 0, backend="cron",
-        detail=f"user={getpass.getuser()}",
+        detail=f"user={getpass.getuser()} profile={profile}",
     )
 
 
@@ -274,37 +276,3 @@ def _cron_status() -> TimerStatus:
         installed=CRON_TAG in existing, backend="cron",
         detail=existing or "(empty crontab)",
     )
-
-
-def write_template_units(scripts_dir: Path) -> None:
-    """Write reference unit files into scripts/ for users who prefer manual install."""
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    (scripts_dir / "claude-migrate.service").write_text(
-        "[Unit]\nDescription=Daily incremental dump of Claude.ai\n\n"
-        "[Service]\nType=oneshot\nExecStart=/usr/local/bin/claude-migrate dump --incremental\n",
-        "utf-8",
-    )
-    (scripts_dir / "claude-migrate.timer").write_text(
-        "[Unit]\nDescription=Daily claude-migrate dump\n\n"
-        "[Timer]\nOnCalendar=daily\nPersistent=true\n\n"
-        "[Install]\nWantedBy=timers.target\n",
-        "utf-8",
-    )
-    (scripts_dir / "com.user.claudemigrate.plist").write_text(
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0"><dict>\n'
-        '  <key>Label</key><string>com.user.claudemigrate</string>\n'
-        '  <key>ProgramArguments</key><array>'
-        '<string>/usr/local/bin/claude-migrate</string>'
-        '<string>dump</string><string>--incremental</string></array>\n'
-        '  <key>StartCalendarInterval</key>'
-        '<dict><key>Hour</key><integer>4</integer></dict>\n'
-        '</dict></plist>\n',
-        "utf-8",
-    )
-
-
-def _platform_label() -> str:
-    return f"{platform.system()} {platform.release()}"

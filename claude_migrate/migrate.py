@@ -43,7 +43,7 @@ async def run_restore(
                 log.warning(
                     "no_local_archive",
                     detail="no rows in `org` table — "
-                    "run `claude-migrate dump` against source first",
+                    "run `claude-migrate backup <source-profile>` first",
                 )
                 return summary
 
