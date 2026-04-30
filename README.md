@@ -3,9 +3,9 @@
 Migrate one Claude.ai consumer account into another, or back up an account incrementally to local SQLite. Conversations land in **target's Recents** with the original transcripts intact, projects and custom styles re-create natively, and memory imports through Anthropic's official paste flow.
 
 ```bash
-claude-migrate login source                  # paste cookies once (~30s)
-claude-migrate login target                  # second account
-claude-migrate migrate source target --execute   # clone source onto target
+claude-migrate add source                    # paste cookies once (~30s)
+claude-migrate add target                    # second account
+claude-migrate migrate source target         # clone source onto target (asks y/N)
 ```
 
 > **Heads-up:** Anthropic's Consumer Terms forbid scraping (§3.4) and automation (§3.7). This tool exists for migrating between **your own** accounts. You accept the risk that the affected accounts may be rate-limited or suspended. The CLI prompts you to acknowledge this on first run.
@@ -61,10 +61,10 @@ Profiles are arbitrary strings (`source`, `target`, `work`, `personal-old`, …)
 
 | Command | What it does |
 |---|---|
-| `claude-migrate login NAME` | Walks you through pasting `sessionKey` and `cf_clearance` from DevTools. Idempotent — running against an existing name overwrites the stored cookies (use this to refresh after expiry). |
-| `claude-migrate logout NAME` | Removes the profile from the keychain. |
+| `claude-migrate add NAME` | Walks you through pasting `sessionKey` and `cf_clearance` from DevTools. Idempotent — running against an existing name overwrites the stored cookies (use this to refresh after expiry). |
+| `claude-migrate remove NAME` | Deletes the profile from the keychain. Local-only — does not invalidate the cookie on Anthropic's side. |
 | `claude-migrate rename OLD NEW` | Renames a stored profile (typo fix or naming change). Pure metadata — no re-paste, no network call. |
-| `claude-migrate accounts` | Lists stored profiles + their last-known identity. No network. Prints management hints for `login`/`rename`/`logout`/`whoami`. |
+| `claude-migrate accounts` | Lists stored profiles + their last-known identity. No network. Prints management hints for `add`/`rename`/`remove`/`whoami`. |
 | `claude-migrate whoami NAME` | Probes the profile against `/api/bootstrap`, prints the live identity, updates the stored `last_probe_ok` timestamp. |
 
 ### Migration
@@ -72,11 +72,12 @@ Profiles are arbitrary strings (`source`, `target`, `work`, `personal-old`, …)
 | Command | What it does |
 |---|---|
 | `claude-migrate backup PROFILE [--full]` | One-shot incremental archive of a profile. Use this if you only want a backup without migrating. |
-| `claude-migrate migrate SOURCE TARGET` | Dry-run plan: backs up source, shows what would be migrated to target. |
-| `claude-migrate migrate SOURCE TARGET --execute` | Actually do it. Re-running is idempotent — already-migrated objects are skipped via the `migration_log` table. |
+| `claude-migrate migrate SOURCE TARGET` | Backs up source, shows the plan, asks `Proceed? [y/N]`, then migrates. Re-running is idempotent — already-migrated objects are skipped via the `migration_log` table. |
+| `claude-migrate migrate SOURCE TARGET --dry-run` | Plan only — show what would happen, exit without prompting or running. |
+| `claude-migrate migrate SOURCE TARGET --yes` | Skip the y/N prompt (for scripts/automation). Same effect as answering `y`. |
 | `claude-migrate verify TARGET [--reconcile]` | Probe each migrated chat on target to confirm it's still there. `--reconcile` drops `migration_log` rows for chats that have been deleted on the server. |
-| `claude-migrate reorder TARGET [--execute]` | No-op PUT each migrated chat on target in source's `updated_at` order, so target's Recents matches the source's. No model calls. |
-| `claude-migrate cleanup TARGET --since ISO [--execute]` | Delete empty (zero-message) chats on target created during a failed run. Each candidate is verified to have zero messages before deletion — real chats are never touched. |
+| `claude-migrate reorder TARGET` | No-op PUT each migrated chat on target in source's `updated_at` order, so target's Recents matches the source's. No model calls. Confirms before running; pass `--dry-run` for preview or `--yes` to skip the prompt. |
+| `claude-migrate cleanup TARGET --since ISO` | Delete empty (zero-message) chats on target created during a failed run. Each candidate is verified to have zero messages before deletion — real chats are never touched. Confirms before running; `--dry-run` / `--yes` available. |
 | `claude-migrate preview UUID` | Print the transcript that would be sent for one source conversation. Use `--show-payload` to see the kind (inline/attachment/chunked) and token count. |
 
 ### Status & diagnostics
@@ -118,15 +119,15 @@ The same fields can be set via environment variables — `CLAUDE_MIGRATE_CLIENT_
 Migrate everything from `source` to a fresh `target`, then keep `source` backed up daily:
 
 ```bash
-# 1. Authenticate both accounts (cookies stored in OS keychain).
-claude-migrate login source
-claude-migrate login target
+# 1. Store cookies for both accounts (OS keychain).
+claude-migrate add source
+claude-migrate add target
 
-# 2. Dry-run preview (default — shows what would happen).
+# 2. (Optional) Preview what will happen — exits without prompting.
+claude-migrate migrate source target --dry-run
+
+# 3. Migrate. Shows the plan, asks "Proceed? [y/N]", then runs. Idempotent.
 claude-migrate migrate source target
-
-# 3. Actually migrate. Idempotent, re-runnable.
-claude-migrate migrate source target --execute
 
 # 4. (Optional) Re-probe each migrated chat to confirm it's still on target.
 claude-migrate verify target
@@ -144,7 +145,7 @@ claude-migrate schedule install
 
 ## Auth walkthrough
 
-`login` walks you through pasting two cookies from DevTools. Anthropic marks `sessionKey` as `HttpOnly`, so the JS console can't see it — you need DevTools' Application/Storage tab. About 30 seconds per profile.
+`add` walks you through pasting two cookies from DevTools. Anthropic marks `sessionKey` as `HttpOnly`, so the JS console can't see it — you need DevTools' Application/Storage tab. About 30 seconds per profile.
 
 ### The two cookies
 
@@ -166,7 +167,7 @@ claude-migrate schedule install
 ### What the CLI shows
 
 ```
-$ claude-migrate login source
+$ claude-migrate add source
 
 Authenticating profile source. You'll paste two cookies from your browser
 (~30 seconds, once per account).
@@ -191,7 +192,7 @@ Confirming credentials with claude.ai...
     Stored as profile 'source' in the OS keychain.
 
   → `claude-migrate whoami source`   live-probe this profile later
-  → `claude-migrate login source`    re-paste cookies after expiry
+  → `claude-migrate add source`      re-paste cookies after expiry
 ```
 
 ### Common copy-paste mistakes (silently fixed)
@@ -224,7 +225,7 @@ The CLI strips these before format validation, so you don't have to think about 
 - Re-fetches only those (incremental — usually 0–5 detail requests)
 - Writes raw gzipped JSON sidecars to `data/raw/{date}/`
 - Updates SQLite + the `checkpoint` table
-- Logs to `data/logs/dump.log`
+- Logs to `data/logs/backup.log`
 
 Per-OS specifics:
 
@@ -235,7 +236,7 @@ Per-OS specifics:
 | macOS | launchd | `~/Library/LaunchAgents/com.user.claudemigrate.plist` |
 | Windows | Task Scheduler | task name `claude-migrate` |
 
-When `sessionKey` eventually expires, the timer fires, hits 401, exits 75, and writes the failure to `dump.log`. Re-run `claude-migrate login source` to refresh.
+When `sessionKey` eventually expires, the timer fires, hits 401, exits 75, and writes the failure to `backup.log`. Re-run `claude-migrate add source` to refresh.
 
 ---
 
@@ -243,15 +244,15 @@ When `sessionKey` eventually expires, the timer fires, hits 401, exits 75, and w
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `login` says "looks too short" | DevTools Value column truncates the display | Click the row, copy from the details panel below the table |
-| `login` says "Cloudflare is challenging the request" | Stale `cf_clearance` | Refresh `claude.ai` in your browser, then `claude-migrate login <profile>` and re-paste |
-| `login` says "TLS fingerprint reject" | curl_cffi out of date | `pip install -U curl_cffi`, retry |
+| `add` says "looks too short" | DevTools Value column truncates the display | Click the row, copy from the details panel below the table |
+| `add` says "Cloudflare is challenging the request" | Stale `cf_clearance` | Refresh `claude.ai` in your browser, then `claude-migrate add <profile>` and re-paste |
+| `add` says "TLS fingerprint reject" | curl_cffi out of date | `pip install -U curl_cffi`, retry |
 | Restore is hitting 429 every chat | Per-account rate limit on `/completion` | Default 90s/chat keeps most accounts under the limit. Override: `export CLAUDE_MIGRATE_CHAT_SLEEP_SEC=120`. The CLI auto-cools-down on 429 (capped exponential up to 600s). |
 | `migrate` fails with HTTP 400/422 | `anthropic-client-sha` rotated | `claude-migrate headers-help` for the capture walkthrough; `claude-migrate config edit` to put the new values in `config.toml` |
 | Restore was interrupted; what's left? | — | `claude-migrate status target` reads `migration_log` (no network) and prints done/total per object type plus recent failures |
 | Failed restore left empty conversations on target | Worker died mid-flight | Find the timestamp of the failed run, then `claude-migrate cleanup target --since 2026-04-30T14:37 --execute`. Each candidate is verified to have zero messages before deletion. |
 | Recents on target are in wrong order | Concurrency > 1 scrambled the migration order | `claude-migrate reorder target --execute` walks source archive in `updated_at ASC` order and bumps each chat's `updated_at` on target |
-| Daily timer fires but does nothing | `sessionKey` expired | Check `data/logs/dump.log`. If it shows 401, run `claude-migrate login source` |
+| Daily timer fires but does nothing | `sessionKey` expired | Check `data/logs/backup.log`. If it shows 401, run `claude-migrate add source` |
 
 ---
 

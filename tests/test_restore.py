@@ -62,6 +62,20 @@ def test_migrate_help_takes_two_positional_args() -> None:
     assert "SOURCE TARGET" in normalized
 
 
+def test_destructive_commands_advertise_dry_run_and_yes() -> None:
+    """migrate / reorder / cleanup all use the same confirm-by-default pattern.
+    --execute is gone; --dry-run previews; --yes skips the prompt."""
+    runner = CliRunner()
+    for cmd in ("migrate", "reorder", "cleanup"):
+        result = runner.invoke(cli, [cmd, "--help"])
+        assert result.exit_code == 0, f"{cmd} --help should succeed"
+        assert "--dry-run" in result.output, f"{cmd} should advertise --dry-run"
+        assert "--yes" in result.output, f"{cmd} should advertise --yes"
+        assert "--execute" not in result.output, (
+            f"{cmd} should not still advertise the removed --execute flag"
+        )
+
+
 def test_status_command_takes_positional_target() -> None:
     runner = CliRunner()
     result = runner.invoke(cli, ["status", "--help"])
@@ -83,17 +97,18 @@ def test_top_level_help_lists_new_verbs() -> None:
     runner = CliRunner()
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
-    for verb in ("login", "logout", "accounts", "backup", "migrate",
+    for verb in ("add", "remove", "accounts", "backup", "migrate",
                  "verify", "reorder", "cleanup", "schedule"):
         assert verb in result.output, f"top-level verb {verb!r} missing from --help"
 
 
 def test_old_verbs_no_longer_registered() -> None:
-    """auth, dump, restore (as separate command), timer (as group) are gone."""
+    """Removed verbs from past renames: auth/dump/restore/timer (first rename),
+    login/logout (second rename to add/remove)."""
     runner = CliRunner()
-    for old in ("auth", "dump", "restore", "timer"):
+    for old in ("auth", "dump", "restore", "timer", "login", "logout"):
         result = runner.invoke(cli, [old, "--help"])
-        assert result.exit_code != 0, f"old command {old!r} unexpectedly still works"
+        assert result.exit_code != 0, f"removed command {old!r} unexpectedly still works"
 
 
 def test_status_prints_all_caught_up_for_complete_migration(
@@ -153,8 +168,8 @@ def test_accounts_command_help() -> None:
     assert "List stored profiles" in result.output
 
 
-def test_accounts_with_no_profiles_shows_login_hint() -> None:
-    """`accounts` with an empty profile list points the user at `login`."""
+def test_accounts_with_no_profiles_shows_add_hint() -> None:
+    """`accounts` with an empty profile list points the user at `add`."""
     from claude_migrate import cli as cli_mod
 
     real = cli_mod.list_profiles
@@ -166,11 +181,11 @@ def test_accounts_with_no_profiles_shows_login_hint() -> None:
         cli_mod.list_profiles = real  # type: ignore[assignment]
     assert result.exit_code == 0
     assert "No profiles stored" in result.output
-    assert "claude-migrate login" in result.output
+    assert "claude-migrate add" in result.output
 
 
 def test_accounts_with_profiles_shows_management_hints() -> None:
-    """The non-empty `accounts` output should advertise login/rename/logout/whoami
+    """The non-empty `accounts` output should advertise add/rename/remove/whoami
     so users discover the profile-management verbs without reading --help."""
     from claude_migrate import cli as cli_mod
     from claude_migrate.auth import Profile
@@ -190,8 +205,8 @@ def test_accounts_with_profiles_shows_management_hints() -> None:
         cli_mod.load_profile = real_load  # type: ignore[assignment]
     assert result.exit_code == 0
     assert "user@example.com" in result.output
-    for hint in ("claude-migrate login", "claude-migrate rename",
-                 "claude-migrate logout", "claude-migrate whoami"):
+    for hint in ("claude-migrate add", "claude-migrate rename",
+                 "claude-migrate remove", "claude-migrate whoami"):
         assert hint in result.output, f"{hint!r} missing from accounts output"
 
 

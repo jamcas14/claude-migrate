@@ -1,9 +1,10 @@
 """User-facing CLI.
 
-Verb-first commands with positional arguments for the primary noun. Dry-run is
-the default for any operation that mutates a remote account; pass `--execute`
-to actually write. Profile names are arbitrary strings (`source`, `target`,
-`work`, `personal-old`, etc.) — there's no special role beyond the name.
+Verb-first commands with positional arguments for the primary noun. Operations
+that mutate a remote account confirm with `Proceed? [y/N]` before running; pass
+`--yes` to skip the prompt or `--dry-run` to preview without prompting. Profile
+names are arbitrary strings (`source`, `target`, `work`, `personal-old`, etc.)
+— there's no special role beyond the name.
 """
 
 from __future__ import annotations
@@ -149,7 +150,7 @@ def _run(coro: object) -> object:
     except AuthExpired as e:
         click.echo(f"\nSession expired: {e}", err=True)
         click.echo(
-            "Run `claude-migrate login <profile>` to re-authenticate, then "
+            "Run `claude-migrate add <profile>` to re-paste cookies, then "
             "re-run the same command to resume.",
             err=True,
         )
@@ -159,7 +160,7 @@ def _run(coro: object) -> object:
         click.echo(f"\nCloudflare challenge: {e}", err=True)
         click.echo(
             "Refresh https://claude.ai once in your browser (this gets you a "
-            "fresh cf_clearance), then `claude-migrate login <profile>`.",
+            "fresh cf_clearance), then `claude-migrate add <profile>`.",
             err=True,
         )
         sys.exit(EXIT_TEMPFAIL)
@@ -206,8 +207,8 @@ def _ensure_tos(ack: bool) -> None:
 @click.group(
     help=(
         "Migrate or back up a Claude.ai consumer account.\n\n"
-        "Run `claude-migrate login source` to authenticate a profile, then\n"
-        "`claude-migrate migrate source target --execute` to clone source to target."
+        "Run `claude-migrate add source` to store credentials for a profile, then\n"
+        "`claude-migrate migrate source target` to clone source to target."
     ),
     context_settings={"help_option_names": ["-h", "--help"]},
 )
@@ -226,18 +227,26 @@ def cli(ctx: click.Context, quiet: bool, verbose: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-@cli.command(help="Authenticate a profile (interactive cookie paste).")
+@cli.command(help="Add a profile (interactive cookie paste).")
 @click.argument("name")
-def login(name: str) -> None:
-    """First-time login OR re-auth after the session expired. Idempotent — running
-    against an existing profile name overwrites the stored cookies."""
+def add(name: str) -> None:
+    """Adds a stored profile, or re-pastes cookies if NAME already exists.
+    Idempotent — running against an existing name overwrites the stored
+    cookies (use this to refresh after the session expires).
+
+    Note: this is purely local — no real "session" is created on Anthropic's
+    side. The cookies live in your OS keychain only.
+    """
     _run(run_auth_flow(name, refreshing=_profile_exists(name)))
 
 
 @cli.command(help="Remove a stored profile from the OS keychain.")
 @click.argument("name")
 @click.confirmation_option(prompt="Delete this profile from the keychain?")
-def logout(name: str) -> None:
+def remove(name: str) -> None:
+    """Local-only — deletes the cookie blob from your keychain. Does NOT
+    invalidate the cookie on Anthropic's side; the original browser session
+    keeps working."""
     remove_profile(name)
     click.echo(f"Removed profile {name!r}.")
 
@@ -247,7 +256,7 @@ def accounts() -> None:
     names = list_profiles()
     if not names:
         click.echo("No profiles stored.")
-        click.echo("  → `claude-migrate login <name>` to authenticate one.")
+        click.echo("  → `claude-migrate add <name>` to store credentials for one.")
         return
     width = max(len("PROFILE"), max(len(n) for n in names))
     click.echo(f"  {'PROFILE':<{width}}  EMAIL                            LAST PROBE")
@@ -260,10 +269,10 @@ def accounts() -> None:
         except AuthError as e:
             click.echo(f"  {n:<{width}}  (error: {e})")
     click.echo("")
-    click.echo("  → `claude-migrate login <name>`         re-paste cookies (refresh expired session)")
-    click.echo("  → `claude-migrate rename OLD NEW`       rename a profile")
-    click.echo("  → `claude-migrate logout <name>`        remove a profile from the keychain")
-    click.echo("  → `claude-migrate whoami <name>`        live-probe a profile's credentials")
+    click.echo("  → `claude-migrate add <name>`     add or re-paste cookies (idempotent)")
+    click.echo("  → `claude-migrate rename OLD NEW` rename a profile")
+    click.echo("  → `claude-migrate remove <name>`  delete a profile from the keychain")
+    click.echo("  → `claude-migrate whoami <name>`  live-probe a profile's credentials")
 
 
 @cli.command(help="Rename a stored profile (no network call, no re-paste needed).")
@@ -280,7 +289,7 @@ def rename(old_name: str, new_name: str) -> None:
     if _profile_exists(new_name):
         click.echo(
             f"A profile named {new_name!r} already exists. Run "
-            f"`claude-migrate logout {new_name}` first if you want to overwrite it.",
+            f"`claude-migrate remove {new_name}` first if you want to overwrite it.",
             err=True,
         )
         sys.exit(2)
@@ -298,7 +307,7 @@ def whoami(name: str) -> None:
     result = _run(verify_profile(name))
     if result is None:
         click.echo(f"\nVerification of {name!r} did not return a result.", err=True)
-        click.echo(f"Run `claude-migrate login {name}` to re-authenticate.", err=True)
+        click.echo(f"Run `claude-migrate add {name}` to re-paste cookies.", err=True)
         sys.exit(1)
     p = load_profile(name)
     click.echo(f"  ✓ {p.email or 'unknown email'}")
@@ -362,11 +371,13 @@ def backup(ctx: click.Context, profile: str, mode: str, tos_ack: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-@cli.command(help="Migrate SOURCE's archive to TARGET. Dry-run by default.")
+@cli.command(help="Migrate SOURCE's archive to TARGET. Asks `Proceed? [y/N]` before mutating.")
 @click.argument("source")
 @click.argument("target")
-@click.option("--execute", is_flag=True,
-              help="Actually perform the migration. Default is dry-run preview.")
+@click.option("--dry-run", is_flag=True,
+              help="Show the plan and exit without prompting or running.")
+@click.option("--yes", "-y", "skip_prompt", is_flag=True,
+              help="Skip the y/N confirmation (for scripts/automation).")
 @click.option("--prefs/--no-prefs", default=True, show_default=True,
               help="Include profile preferences (name/role/traits).")
 @click.option("--styles/--no-styles", default=True, show_default=True,
@@ -387,7 +398,8 @@ def backup(ctx: click.Context, profile: str, mode: str, tos_ack: bool) -> None:
 def migrate(
     source: str,
     target: str,
-    execute: bool,
+    dry_run: bool,
+    skip_prompt: bool,
     prefs: bool,
     styles: bool,
     projects: bool,
@@ -397,8 +409,10 @@ def migrate(
     skip_reorder: bool,
     tos_ack: bool,
 ) -> None:
-    """Refresh the source archive, then create / update each chat & project on
-    target. Idempotent — re-running picks up only what's new since last time."""
+    """Refresh the source archive, show the plan, ask `Proceed? [y/N]`, then
+    create/update each chat & project on target. Idempotent — re-running picks
+    up only what's new since last time. `--dry-run` shows the plan without
+    prompting; `--yes` skips the prompt for automation."""
     _ensure_tos(tos_ack)
     ensure_data_dir()
 
@@ -429,7 +443,7 @@ def migrate(
         _run(_backup())
         click.echo("")
 
-    # Step 2: dry-run plan (always shown)
+    # Step 2: show the plan (always)
     click.echo(f"Step 2/3: plan against target ({target})")
     plan = _run(dry_run_plan(target_profile=target))
     if not isinstance(plan, dict):
@@ -453,8 +467,18 @@ def migrate(
         plan["conversations_pending"], plan["conversations_total"], conversations,
     ))
 
-    if not execute:
-        click.echo("\n(dry-run — pass --execute to migrate)")
+    if dry_run:
+        click.echo("\n(dry-run — no changes made)")
+        return
+
+    pending_total = (
+        (plan["styles_pending"] if styles else 0)
+        + (plan["projects_pending"] if projects else 0)
+        + (plan["conversations_pending"] if conversations else 0)
+        + (1 if prefs else 0)
+    )
+    if pending_total == 0:
+        click.echo("\n  ✓ Nothing to migrate — target already matches archive.")
         return
 
     # Probe target identity before any destructive call so the user can catch a
@@ -466,10 +490,18 @@ def migrate(
     confirmation = _run(_confirm_target())
     if isinstance(confirmation, tuple):
         email, org_name = confirmation
-        click.echo(f"\nStep 3/3: migrating to target ({target})")
-        click.echo(f"  ✓ {email or '?'}{f' ({org_name})' if org_name else ''}")
+        target_label = f"{email or '?'}{f' ({org_name})' if org_name else ''}"
     else:
-        click.echo(f"\nStep 3/3: migrating to target ({target})")
+        target_label = target
+
+    click.echo("")
+    click.echo(f"Step 3/3: about to migrate to {target_label}.")
+
+    if not skip_prompt and not click.confirm(
+        f"Proceed with {pending_total} pending item(s)?", default=False
+    ):
+        click.echo("Aborted.")
+        return
 
     summary = _run(run_restore(
         target_profile=target,
@@ -500,7 +532,7 @@ def migrate(
         click.echo(f"\n  failures: {len(failed)} — first few:")
         for src_uuid, err in failed[:5]:
             click.echo(f"    {src_uuid[:8]} → {err}")
-        click.echo(f"  Re-run `claude-migrate migrate {source} {target} --execute` to retry.")
+        click.echo(f"  Re-run `claude-migrate migrate {source} {target}` to retry.")
 
     # Step 4 (optional): reorder
     if conversations and not skip_reorder and not failed:
@@ -559,7 +591,7 @@ def verify(target: str, reconcile: bool) -> None:
         if result["reconciled"]:
             click.echo(
                 f"  → dropped {len(missing)} migration_log row(s); "
-                f"run `claude-migrate migrate <source> {target} --execute` to recreate."
+                f"run `claude-migrate migrate <source> {target}` to recreate."
             )
         else:
             click.echo(
@@ -572,34 +604,68 @@ def verify(target: str, reconcile: bool) -> None:
 
 @cli.command(help="Re-PUT each migrated chat on TARGET in source updated_at order.")
 @click.argument("target")
-@click.option("--execute", is_flag=True,
-              help="Actually reorder. Default is dry-run preview.")
-def reorder(target: str, execute: bool) -> None:
+@click.option("--dry-run", is_flag=True,
+              help="Show how many chats would be touched and exit without prompting.")
+@click.option("--yes", "-y", "skip_prompt", is_flag=True,
+              help="Skip the y/N confirmation (for scripts/automation).")
+def reorder(target: str, dry_run: bool, skip_prompt: bool) -> None:
     """Each PUT bumps the chat's `updated_at`, so iterating in source-ASC order
-    leaves Recents matching the source. No model calls — safe to re-run."""
+    leaves Recents matching the source. No model calls — safe to re-run.
 
-    async def run() -> None:
+    Asks `Proceed? [y/N]` before running. `--dry-run` previews without prompting;
+    `--yes` skips the prompt for automation."""
+
+    async def preview() -> tuple[str, str, int, int]:
         async with open_session(target) as session:
-            click.echo(f"  target: {session.email} ({session.org_uuid[:8]}...)")
+            email = session.email or "?"
+            org = session.org_uuid
             conn = open_db()
             try:
                 state = RestoreState(conn, target)
-                touched, missing, errors = await reorder_conversations(
+                touched, missing, _errors = await reorder_conversations(
                     session.client, conn, session.org_uuid, state,
-                    dry_run=not execute,
+                    dry_run=True,
                 )
             finally:
                 conn.close()
-            verb = "would touch" if not execute else "touched"
-            click.echo(f"  {verb} {touched} chat(s)")
-            if missing:
-                click.echo(f"  {missing} source chats had no migration_log entry (skipped)")
+        return email, org, touched, missing
+
+    result = _run(preview())
+    if not isinstance(result, tuple):
+        return
+    email, org, touched, missing = result
+    click.echo(f"  target: {email} ({org[:8]}...)")
+    click.echo(f"  would touch {touched} chat(s)")
+    if missing:
+        click.echo(f"  {missing} source chats had no migration_log entry (skipped)")
+
+    if dry_run:
+        click.echo("\n(dry-run — no changes made)")
+        return
+    if touched == 0:
+        click.echo("\n  ✓ Nothing to reorder.")
+        return
+    if not skip_prompt and not click.confirm(
+        f"Reorder {touched} chat(s) on {email}?", default=False
+    ):
+        click.echo("Aborted.")
+        return
+
+    async def run() -> None:
+        async with open_session(target) as session:
+            conn = open_db()
+            try:
+                state = RestoreState(conn, target)
+                done, _miss, errors = await reorder_conversations(
+                    session.client, conn, session.org_uuid, state, dry_run=False,
+                )
+            finally:
+                conn.close()
+            click.echo(f"  touched {done} chat(s)")
             if errors:
                 click.echo(f"  errors: {len(errors)}")
                 for src_uuid, err in errors[:5]:
                     click.echo(f"    {src_uuid[:8]} → {err}")
-            if not execute:
-                click.echo("\n(dry-run — pass --execute to actually reorder)")
 
     _run(run())
 
@@ -615,11 +681,19 @@ def reorder(target: str, execute: bool) -> None:
     "--until", "until_iso", default=None,
     help="Upper bound. Defaults to --since + 1 hour.",
 )
-@click.option("--execute", is_flag=True,
-              help="Actually delete. Default is dry-run preview.")
-def cleanup(target: str, since_iso: str, until_iso: str | None, execute: bool) -> None:
+@click.option("--dry-run", is_flag=True,
+              help="Scan and list orphans, exit without prompting or deleting.")
+@click.option("--yes", "-y", "skip_prompt", is_flag=True,
+              help="Skip the y/N confirmation (for scripts/automation).")
+def cleanup(
+    target: str, since_iso: str, until_iso: str | None,
+    dry_run: bool, skip_prompt: bool,
+) -> None:
     """Each candidate is fetched and verified to have ZERO messages before
-    deletion — so a real chat with content can never be touched."""
+    deletion — so a real chat with content can never be touched.
+
+    Asks `Proceed? [y/N]` before deleting. `--dry-run` lists orphans without
+    prompting; `--yes` skips the prompt for automation."""
     from datetime import UTC, datetime, timedelta
 
     def _parse(s: str) -> datetime:
@@ -645,7 +719,9 @@ def cleanup(target: str, since_iso: str, until_iso: str | None, execute: bool) -
         )
         sys.exit(2)
 
-    async def run() -> None:
+    # We have to scan first to find candidates — that's read-only, safe before
+    # any prompt. Deletion only happens after confirm.
+    async def scan() -> tuple[str, str, list[dict[str, object]]]:
         async with open_session(target) as session:
             click.echo(f"  target: {session.email} ({session.org_uuid[:8]}...)")
             click.echo(f"  window: {since_dt.isoformat()} → {until_dt.isoformat()}")
@@ -655,16 +731,34 @@ def cleanup(target: str, since_iso: str, until_iso: str | None, execute: bool) -
                 created_after=since_dt, created_before=until_dt,
                 require_empty_name=False,
             )
-            click.echo(f"  confirmed orphans: {len(orphans)}")
-            for c in orphans[:20]:
-                click.echo(
-                    f"    {c.get('uuid', '?')[:8]}  created {c.get('created_at', '?')}"
-                )
-            if len(orphans) > 20:
-                click.echo(f"    ... and {len(orphans) - 20} more")
-            if not execute:
-                click.echo("\n(dry-run — pass --execute to delete)")
-                return
+            return session.email or "?", session.org_uuid, orphans
+
+    scan_result = _run(scan())
+    if not isinstance(scan_result, tuple):
+        return
+    email, _org_uuid, orphans = scan_result
+    click.echo(f"  confirmed orphans: {len(orphans)}")
+    for c in orphans[:20]:
+        click.echo(
+            f"    {c.get('uuid', '?')[:8]}  created {c.get('created_at', '?')}"
+        )
+    if len(orphans) > 20:
+        click.echo(f"    ... and {len(orphans) - 20} more")
+
+    if dry_run:
+        click.echo("\n(dry-run — no chats deleted)")
+        return
+    if not orphans:
+        click.echo("\n  ✓ Nothing to clean up.")
+        return
+    if not skip_prompt and not click.confirm(
+        f"Delete {len(orphans)} orphan chat(s) from {email}?", default=False
+    ):
+        click.echo("Aborted.")
+        return
+
+    async def delete() -> None:
+        async with open_session(target) as session:
             deleted = 0
             for c in orphans:
                 cu = c.get("uuid")
@@ -674,7 +768,7 @@ def cleanup(target: str, since_iso: str, until_iso: str | None, execute: bool) -
                     deleted += 1
             click.echo(f"  deleted {deleted}/{len(orphans)} orphans")
 
-    _run(run())
+    _run(delete())
 
 
 @cli.command(help="Print the transcript that would be sent for a stored conversation.")
@@ -730,7 +824,7 @@ def status(target: str) -> None:
             click.echo(f"    {f['source_uuid'][:8]}  {f['object_type']}  {err_short}")
         click.echo("")
         click.echo(
-            f"  → Re-run `claude-migrate migrate <source> {target} --execute` "
+            f"  → Re-run `claude-migrate migrate <source> {target}` "
             "to retry failed objects."
         )
     else:
@@ -748,7 +842,7 @@ def status(target: str) -> None:
             )
         else:
             click.echo(
-                f"  → Run `claude-migrate migrate <source> {target} --execute` "
+                f"  → Run `claude-migrate migrate <source> {target}` "
                 "to migrate remaining items."
             )
 
@@ -780,7 +874,7 @@ def doctor() -> None:
     did = settings.device_id
     click.echo(f"  device_id:       {did or '(unset)'}{'  (optional)' if not did else ''}")
     profiles = list_profiles()
-    click.echo(f"  profiles:        {', '.join(profiles) or '(none — run `login <name>`)'}")
+    click.echo(f"  profiles:        {', '.join(profiles) or '(none — run `add <name>`)'}")
 
 
 @cli.command("headers-help",

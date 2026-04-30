@@ -278,7 +278,7 @@ def load_profile(name: str) -> Profile:
             data = blob[name]
         else:
             raise AuthMissing(
-                f"No profile named {name!r} found. Run `claude-migrate login {name}` first."
+                f"No profile named {name!r} found. Run `claude-migrate add {name}` first."
             )
     else:
         try:
@@ -286,14 +286,14 @@ def load_profile(name: str) -> Profile:
         except json.JSONDecodeError as e:
             raise AuthInvalid(
                 f"Stored profile {name!r} is malformed in the keychain. "
-                f"Run `claude-migrate login {name}` to recreate it."
+                f"Run `claude-migrate add {name}` to recreate it."
             ) from e
     try:
         return Profile(**data)
     except TypeError as e:
         raise AuthInvalid(
             f"Stored profile {name!r} is missing required fields ({e}). "
-            f"Run `claude-migrate login {name}` to recreate it."
+            f"Run `claude-migrate add {name}` to recreate it."
         ) from e
 
 
@@ -386,7 +386,7 @@ def _prompt_with_retries(
                     "  • The cookie has expired — sign in to claude.ai again "
                     "and re-copy.\n"
                     "Run `claude-migrate doctor` to confirm your environment, "
-                    "or `claude-migrate login <profile>` to retry."
+                    "or `claude-migrate add <profile>` to retry."
                 )
                 if extra_help:
                     msg += f"\n\n{extra_help}"
@@ -482,7 +482,7 @@ async def run_auth_flow(profile_name: str, *, refreshing: bool = False) -> Profi
     print(f"    Stored as profile {profile_name!r} in the OS keychain.")
     print()
     print(f"  → `claude-migrate whoami {profile_name}`   live-probe this profile later")
-    print(f"  → `claude-migrate login {profile_name}`    re-paste cookies after expiry")
+    print(f"  → `claude-migrate add {profile_name}`      re-paste cookies after expiry")
     return profile
 
 
