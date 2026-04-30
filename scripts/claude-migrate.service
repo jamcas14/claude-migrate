@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily incremental dump of Claude.ai accounts
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/claude-migrate dump --incremental --quiet
+StandardOutput=append:%h/.local/state/claude-migrate/dump.log
+StandardError=append:%h/.local/state/claude-migrate/dump.log
+
+[Install]
+WantedBy=default.target

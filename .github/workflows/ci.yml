@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install deps
+        run: uv sync --all-extras
+
+      - name: Lint (ruff)
+        run: uv run ruff check claude_migrate tests
+
+      - name: Type-check (mypy --strict)
+        run: uv run mypy claude_migrate
+
+      - name: Test (pytest)
+        run: uv run pytest -q
