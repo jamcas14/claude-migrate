@@ -14,21 +14,38 @@ claude-migrate migrate source target         # clone source onto target (asks y/
 
 ## Install
 
+Pick whichever Python tool installer you have. Both put `claude-migrate` on your `$PATH` so you can run it from any directory.
+
 ```bash
-git clone <repo-url>
-cd claude-migrate
-uv sync                       # creates .venv with all deps
-uv run claude-migrate --help
+# Recommended: uv (fast, modern; install with: curl -LsSf https://astral.sh/uv/install.sh | sh)
+uv tool install git+https://github.com/jamcas14/claude-migrate.git
+
+# Or: pipx
+pipx install git+https://github.com/jamcas14/claude-migrate.git
 ```
 
-If you'd rather have it on `$PATH`:
+Verify:
 
 ```bash
-pipx install --editable .
 claude-migrate --help
 ```
 
+To upgrade later: `uv tool upgrade claude-migrate` (or `pipx upgrade claude-migrate`).
+
 Requires Python 3.12+. macOS, Linux, and Windows are supported.
+
+### Optional: short alias
+
+If `claude-migrate` is too long for daily use, alias it in your shell rc:
+
+```bash
+# bash / zsh
+echo "alias cm='claude-migrate'" >> ~/.bashrc  # or ~/.zshrc
+# fish
+alias --save cm 'claude-migrate'
+```
+
+After re-sourcing, `cm migrate src tgt` works.
 
 ### Tab-completion of profile names
 
@@ -46,6 +63,18 @@ _CLAUDE_MIGRATE_COMPLETE=fish_source claude-migrate > ~/.config/fish/completions
 ```
 
 After re-sourcing your rc, `claude-migrate whoami so<Tab>` expands to `source` (etc).
+
+### Development install (only if you're hacking on the code)
+
+```bash
+git clone https://github.com/jamcas14/claude-migrate.git
+cd claude-migrate
+uv sync --all-extras    # creates .venv with all deps including dev
+uv run pytest           # run the test suite
+uv run claude-migrate --help
+```
+
+The `uv run` prefix is only needed for the development checkout. End users get the bare `claude-migrate` command via the install commands above.
 
 ---
 
@@ -370,13 +399,15 @@ claude_migrate/
 ## Development
 
 ```bash
+git clone https://github.com/jamcas14/claude-migrate.git
+cd claude-migrate
 uv sync --all-extras
-uv run pytest             # 148+ tests
+uv run pytest              # 280+ tests
 uv run mypy claude_migrate # strict mode
 uv run ruff check
 ```
 
-The test suite covers auth normalization (every common paste mistake), the HTTP layer's status-code → typed-error mapping, transcript rendering (thinking summaries, tool-call placeholders, citations, files, project context), the restore-state log projection, the rate-limit pacer (cooldown growth, reset, parallel safety), and the per-payload wire format on the way to `/completion`.
+The test suite covers auth normalization (every common paste mistake), the HTTP layer's status-code → typed-error mapping, transcript rendering (thinking summaries, tool-call placeholders, citations, files, project context), the restore-state log projection, the rate-limit pacer (cooldown floor, AIMD growth/decay, cascade-abort detection, parallel safety), and the per-payload wire format on the way to `/completion`.
 
 ---
 
