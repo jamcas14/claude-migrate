@@ -141,15 +141,24 @@ async def verify_target_conversations(
     reconcile: bool = False,
 ) -> dict[str, Any]:
     """For each conversation logged as `ok` against this profile, GET the
-    target to confirm it still exists. Returns counts + missing UUIDs.
+    target to confirm it still exists.
 
-    If `reconcile=True`, drops migration_log rows for missing target convs so
-    a subsequent `migrate` will re-create them.
+    Returns counts + per-bucket UUIDs:
+      - confirmed: probe returned 2xx
+      - missing: probe returned 404 (`EndpointChanged`)
+      - unknown: probe failed for any other reason (network, 5xx, rate limit)
+        — neither confirmed-on-target nor confirmed-missing, so we surface the
+        list and refuse to reconcile any of them automatically.
+
+    If `reconcile=True`, drops migration_log rows for the `missing` bucket so
+    a subsequent `migrate` will re-create them. Unknown rows are NOT
+    reconciled — that would erase server-confirmed work on a transient blip.
     """
     from .errors import EndpointChanged, NetworkError
 
     confirmed = 0
     missing: list[tuple[str, str]] = []
+    unknown: list[tuple[str, str, str]] = []  # (src, tgt, error)
     async with open_session(target_profile) as session:
         conn = open_db()
         try:
@@ -169,6 +178,7 @@ async def verify_target_conversations(
                         "verify_probe_failed",
                         source_uuid=source_uuid, err=str(e),
                     )
+                    unknown.append((source_uuid, target_uuid, str(e)))
             if reconcile and missing:
                 for src_uuid, _ in missing:
                     state.drop(src_uuid)
@@ -178,5 +188,6 @@ async def verify_target_conversations(
             "email": session.email,
             "confirmed": confirmed,
             "missing": missing,
+            "unknown": unknown,
             "reconciled": reconcile and bool(missing),
         }

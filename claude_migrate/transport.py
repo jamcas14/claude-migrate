@@ -188,7 +188,18 @@ async def _upload_attachment(
         mime.close()
     if resp.status_code != 200:
         raise NetworkError(f"upload returned {resp.status_code}")
-    j = json.loads(resp.content)
+    try:
+        j = json.loads(resp.content)
+    except json.JSONDecodeError as e:
+        # /upload occasionally serves a Cloudflare interstitial page with a
+        # 200 status code; surface as SchemaDrift rather than crashing on
+        # an uncaught JSONDecodeError.
+        raise SchemaDrift(
+            f"upload returned 200 but body is not JSON: "
+            f"{resp.content[:200]!r}"
+        ) from e
+    if not isinstance(j, dict):
+        raise SchemaDrift(f"upload returned 200 with non-dict body: {type(j).__name__}")
     fu = j.get("file_uuid") or j.get("uuid")
     if not isinstance(fu, str):
         raise SchemaDrift("upload response missing file_uuid")

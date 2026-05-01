@@ -10,6 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 from .config import data_dir
 
@@ -42,11 +43,41 @@ def detect_backend() -> str:
     return "unsupported"
 
 
-def _claude_migrate_path() -> str:
+def _claude_migrate_argv() -> list[str]:
+    """Return the argv prefix that invokes the CLI as a list of tokens.
+
+    Returning a list (not a string) avoids the round-trip-through-split
+    bug that mangles paths containing spaces (`/Users/My Name/.local/...`).
+    """
     p = shutil.which("claude-migrate")
     if p:
-        return p
-    return f"{sys.executable} -m claude_migrate"
+        return [p]
+    return [sys.executable, "-m", "claude_migrate"]
+
+
+def _shell_quote_for_systemd(argv: list[str]) -> str:
+    """systemd ExecStart accepts shell-style quoting; double-quote any token
+    with a space and escape embedded `"`/`\\`."""
+    out: list[str] = []
+    for tok in argv:
+        if any(ch in tok for ch in ' \t"\\'):
+            esc = tok.replace("\\", "\\\\").replace('"', '\\"')
+            out.append(f'"{esc}"')
+        else:
+            out.append(tok)
+    return " ".join(out)
+
+
+def _shell_quote_for_cron(argv: list[str]) -> str:
+    """cron lines are shell-evaluated; use single quotes (POSIX-safe)."""
+    out: list[str] = []
+    for tok in argv:
+        if not tok or any(ch in tok for ch in " \t\"'\\$;&|<>*?(){}#~`!"):
+            esc = tok.replace("'", "'\\''")
+            out.append(f"'{esc}'")
+        else:
+            out.append(tok)
+    return " ".join(out)
 
 
 def _systemd_dir() -> Path:
@@ -58,7 +89,8 @@ def _systemd_dir() -> Path:
 def _systemd_install(profile: str) -> TimerStatus:
     udir = _systemd_dir()
     udir.mkdir(parents=True, exist_ok=True)
-    exe = _claude_migrate_path()
+    argv = [*_claude_migrate_argv(), "--quiet", "backup", profile]
+    exec_start = _shell_quote_for_systemd(argv)
     log_dir = data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     service = (
@@ -68,7 +100,7 @@ def _systemd_install(profile: str) -> TimerStatus:
         "After=network-online.target\n\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"ExecStart={exe} --quiet backup {profile}\n"
+        f"ExecStart={exec_start}\n"
         f"WorkingDirectory={data_dir().parent}\n"
         f"StandardOutput=append:{log_dir}/backup.log\n"
         f"StandardError=append:{log_dir}/backup.log\n"
@@ -122,11 +154,15 @@ def _launchd_plist_path() -> Path:
 def _launchd_install(profile: str) -> TimerStatus:
     p = _launchd_plist_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    exe = _claude_migrate_path()
     log_dir = data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    args = [*exe.split(), "--quiet", "backup", profile]
-    program_args = "".join(f"<string>{a}</string>" for a in args)
+    args = [*_claude_migrate_argv(), "--quiet", "backup", profile]
+    # Each <string> wraps one argv token; XML-escape so a path with `&`/`<`/`>`
+    # doesn't break the plist parser.
+    extra = {'"': "&quot;", "'": "&apos;"}
+    program_args = "".join(
+        f"<string>{xml_escape(a, extra)}</string>" for a in args
+    )
     plist = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -162,11 +198,14 @@ def _launchd_status() -> TimerStatus:
 
 
 def _task_scheduler_install(profile: str) -> TimerStatus:
-    exe = _claude_migrate_path()
+    # Profile name is validated at the CLI boundary against a strict regex,
+    # but defense-in-depth: this string is interpreted by Windows cmd.exe as
+    # the /TR argument. We use subprocess.list2cmdline to escape paths/spaces.
+    argv = [*_claude_migrate_argv(), "--quiet", "backup", profile]
+    tr_value = subprocess.list2cmdline(argv)
     cmd = [
         "schtasks", "/Create", "/SC", "DAILY", "/TN", "claude-migrate",
-        "/TR", f'"{exe}" --quiet backup {profile}',
-        "/ST", "04:17", "/F",
+        "/TR", tr_value, "/ST", "04:17", "/F",
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return TimerStatus(
@@ -245,8 +284,9 @@ CRON_TAG = "# claude-migrate (managed)"
 
 
 def _cron_install(profile: str) -> TimerStatus:
-    exe = _claude_migrate_path()
-    line = f"17 4 * * * {exe} --quiet backup {profile}  {CRON_TAG}\n"
+    argv = [*_claude_migrate_argv(), "--quiet", "backup", profile]
+    cmd = _shell_quote_for_cron(argv)
+    line = f"17 4 * * * {cmd}  {CRON_TAG}\n"
     existing = subprocess.run(
         ["crontab", "-l"], capture_output=True, text=True, check=False
     ).stdout

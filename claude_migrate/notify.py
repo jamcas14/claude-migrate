@@ -8,6 +8,7 @@ import subprocess
 import sys
 import urllib.request
 from urllib.error import URLError
+from xml.sax.saxutils import escape as xml_escape
 
 import structlog
 
@@ -69,14 +70,19 @@ def _windows_toast(title: str, body: str) -> None:
     powershell = shutil.which("powershell.exe") or shutil.which("powershell")
     if not powershell:
         return
-    safe_title = title.replace("'", "''")
-    safe_body = body.replace("'", "''")
+    # Escape for both the XML payload (`<`, `>`, `&`, plus quotes) AND the
+    # PowerShell single-quoted string ('' for embedded '). Doing only the
+    # latter leaves the toast vulnerable to XML-malformed titles and lets a
+    # title containing `</text>` break the binding template.
+    extra = {'"': "&quot;", "'": "&apos;"}
+    xml_title = xml_escape(title, extra).replace("'", "''")
+    xml_body = xml_escape(body, extra).replace("'", "''")
     script = (
         "[Windows.UI.Notifications.ToastNotificationManager,"
         "Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null;"
         f"$xml = [xml]\"<toast><visual><binding template='ToastText02'>"
-        f"<text id='1'>{safe_title}</text>"
-        f"<text id='2'>{safe_body}</text></binding></visual></toast>\";"
+        f"<text id='1'>{xml_title}</text>"
+        f"<text id='2'>{xml_body}</text></binding></visual></toast>\";"
         "$doc = New-Object Windows.Data.Xml.Dom.XmlDocument;"
         "$doc.LoadXml($xml.OuterXml);"
         "$toast = [Windows.UI.Notifications.ToastNotification]::new($doc);"

@@ -117,7 +117,13 @@ async def fetch_conversation_list(
     client: ClaudeClient, org_uuid: str
 ) -> list[dict[str, Any]]:
     """Serial pagination — parallel reads against this endpoint return
-    inconsistent windows because the cursor isn't snapshot-stable."""
+    inconsistent windows because the cursor isn't snapshot-stable.
+
+    Termination: only on empty page. A short page (`len < LIST_PAGE_SIZE`)
+    is NOT a terminator — claude.ai sometimes returns short windows mid-
+    stream when filter dedup happens server-side, and bailing early there
+    silently drops conversations from the backup.
+    """
     out: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
@@ -127,17 +133,21 @@ async def fetch_conversation_list(
         page = await client.get_json(
             f"/api/organizations/{org_uuid}/chat_conversations", params=params
         )
-        if not isinstance(page, list):
-            break
-        if not page:
+        if not isinstance(page, list) or not page:
             break
         out.extend(p for p in page if isinstance(p, dict))
         last = page[-1]
         if not isinstance(last, dict) or "uuid" not in last:
             break
-        cursor = last["uuid"]
-        if len(page) < LIST_PAGE_SIZE:
+        next_cursor = last["uuid"]
+        # Defensive: if the API returns the same final UUID two pages in a
+        # row, the cursor isn't advancing — bail rather than spin forever.
+        if next_cursor == cursor:
+            log.warning("conv_list_cursor_stuck", cursor=cursor)
             break
+        # Cursor advance only — do not break on short page; rely on the next
+        # request returning empty as the true end-of-stream signal.
+        cursor = next_cursor
     return out
 
 
@@ -212,7 +222,17 @@ async def dump_all(
         await fetch_project_docs(client, conn, p_uuid, org_uuid)
 
     if projects:
-        await asyncio.gather(*(doc_task(p["uuid"]) for p in projects), return_exceptions=False)
+        # return_exceptions=True so one project's 404 on /docs doesn't abort
+        # the entire fan-out; each per-task failure is already logged inside
+        # `fetch_project_docs` via its except branches.
+        results = await asyncio.gather(
+            *(doc_task(p["uuid"]) for p in projects), return_exceptions=True
+        )
+        for p, res in zip(projects, results, strict=False):
+            if isinstance(res, BaseException):
+                log.warning(
+                    "project_docs_failed", project_uuid=p.get("uuid"), err=str(res),
+                )
 
     listing = await fetch_conversation_list(client, org_uuid)
     counts["conversations"] = len(listing)
@@ -243,8 +263,19 @@ async def dump_all(
             )
 
     if listing:
-        await asyncio.gather(
-            *(conv_task(m) for m in listing if "uuid" in m), return_exceptions=False
+        # return_exceptions=True so one conversation's hard failure doesn't
+        # abort the rest of the backup. `conv_task` already logs and counts
+        # per-conv failures; this just guards the gather boundary.
+        conv_results = await asyncio.gather(
+            *(conv_task(m) for m in listing if "uuid" in m),
+            return_exceptions=True,
         )
+        for m, res in zip(
+            (m for m in listing if "uuid" in m), conv_results, strict=False,
+        ):
+            if isinstance(res, BaseException):
+                log.warning(
+                    "conv_task_failed", uuid=m.get("uuid"), err=str(res),
+                )
 
     return counts

@@ -26,6 +26,7 @@ from .auth import (
     load_profile,
     remove_profile,
     run_auth_flow,
+    validate_profile_name,
     verify_profile,
 )
 from .config import (
@@ -70,6 +71,21 @@ from .store import ensure_data_dir, open_db
 
 EXIT_TEMPFAIL = 75
 EXIT_TOS = 64
+
+
+def _profile_arg_callback(
+    ctx: click.Context, param: click.Parameter, value: str | None,
+) -> str | None:
+    """Click callback. Rejects profile names that could leak into scheduler
+    subprocess args (schtasks /TR, systemd ExecStart, cron lines), SQL keys,
+    or filesystem paths. Allowed: ``[A-Za-z0-9._-]{1,64}``."""
+    if value is None:
+        return None
+    try:
+        validate_profile_name(value)
+    except AuthInvalid as e:
+        raise click.BadParameter(str(e)) from e
+    return value
 
 TOS_BANNER = (
     "Heads up: Anthropic's Consumer Terms (§3.4 prohibits scraping, §3.7\n"
@@ -240,7 +256,7 @@ def cli(ctx: click.Context, quiet: bool, verbose: bool) -> None:
 
 
 @cli.command(help="Add a profile (interactive cookie paste).")
-@click.argument("name")
+@click.argument("name", callback=_profile_arg_callback)
 def add(name: str) -> None:
     """Adds a stored profile, or re-pastes cookies if NAME already exists.
     Idempotent — running against an existing name overwrites the stored
@@ -253,7 +269,7 @@ def add(name: str) -> None:
 
 
 @cli.command(help="Remove a stored profile from the OS keychain.")
-@click.argument("name")
+@click.argument("name", callback=_profile_arg_callback)
 @click.confirmation_option(prompt="Delete this profile from the keychain?")
 def remove(name: str) -> None:
     """Local-only — deletes the cookie blob from your keychain. Does NOT
@@ -288,8 +304,8 @@ def accounts() -> None:
 
 
 @cli.command(help="Rename a stored profile (no network call, no re-paste needed).")
-@click.argument("old_name")
-@click.argument("new_name")
+@click.argument("old_name", callback=_profile_arg_callback)
+@click.argument("new_name", callback=_profile_arg_callback)
 def rename(old_name: str, new_name: str) -> None:
     """Local metadata operation. Useful for typo fixes (`source` → `soource`)
     or naming changes (`work` → `work-old`). The cookies and the discovered
@@ -312,7 +328,7 @@ def rename(old_name: str, new_name: str) -> None:
 
 
 @cli.command(help="Probe a profile to confirm its credentials still work.")
-@click.argument("name")
+@click.argument("name", callback=_profile_arg_callback)
 def whoami(name: str) -> None:
     """Hits /api/bootstrap with the stored cookies, prints the authenticated
     identity, and updates the profile's `last_probe_ok` timestamp on success."""
@@ -340,7 +356,7 @@ def _profile_exists(name: str) -> bool:
 
 
 @cli.command(help="Pull a profile's archive into local SQLite (incremental by default).")
-@click.argument("profile")
+@click.argument("profile", callback=_profile_arg_callback)
 @click.option("--full", "mode", flag_value="full", help="Re-fetch everything, ignore checkpoints.")
 @click.option("--incremental", "mode", flag_value="incremental",
               default=True, help="Only fetch changed objects (default).")
@@ -380,8 +396,8 @@ def backup(ctx: click.Context, profile: str, mode: str, tos_ack: bool) -> None:
 
 
 @cli.command(help="Migrate SOURCE's archive to TARGET. Asks `Proceed? [y/N]` before mutating.")
-@click.argument("source")
-@click.argument("target")
+@click.argument("source", callback=_profile_arg_callback)
+@click.argument("target", callback=_profile_arg_callback)
 @click.option("--dry-run", is_flag=True,
               help="Show the plan and exit without prompting or running.")
 @click.option("--yes", "-y", "skip_prompt", is_flag=True,
@@ -569,7 +585,7 @@ async def _reorder_run(profile: str) -> None:
 
 
 @cli.command(help="Probe each migrated chat on TARGET to confirm it's still there.")
-@click.argument("target")
+@click.argument("target", callback=_profile_arg_callback)
 @click.option("--reconcile", is_flag=True,
               help="Drop migration_log rows for chats no longer on target so the "
               "next migrate re-creates them.")
@@ -580,6 +596,7 @@ def verify(target: str, reconcile: bool) -> None:
     click.echo(f"  target: {result['email']}")
     click.echo(f"  ✓ {result['confirmed']} confirmed on target")
     missing = result["missing"]
+    unknown = result.get("unknown", [])
     if missing:
         click.echo(f"  ✗ {len(missing)} missing on target:")
         for src_uuid, tgt_uuid in missing[:10]:
@@ -596,12 +613,24 @@ def verify(target: str, reconcile: bool) -> None:
                 f"\n  → Run `claude-migrate verify {target} --reconcile` to drop "
                 "these entries; the next migrate will recreate them."
             )
-    else:
+    if unknown:
+        click.echo(f"  ? {len(unknown)} unknown (probe failed — not classified):")
+        for src_uuid, tgt_uuid, err in unknown[:5]:
+            click.echo(
+                f"    source {src_uuid[:8]} → target {tgt_uuid[:8]}: {err[:80]}"
+            )
+        if len(unknown) > 5:
+            click.echo(f"    ... and {len(unknown) - 5} more")
+        click.echo(
+            "  (unknown rows are NOT reconciled — re-run verify after the "
+            "transient issue is gone.)"
+        )
+    if not missing and not unknown:
         click.echo("\n  All migrated chats are still on target.")
 
 
 @cli.command(help="Re-PUT each migrated chat on TARGET in source updated_at order.")
-@click.argument("target")
+@click.argument("target", callback=_profile_arg_callback)
 @click.option("--dry-run", is_flag=True,
               help="Show how many chats would be touched and exit without prompting.")
 @click.option("--yes", "-y", "skip_prompt", is_flag=True,
@@ -698,7 +727,7 @@ def _parse_window_arg(s: str) -> datetime:
 
 
 @cli.command(help="Delete empty conversations on TARGET created during a failed run.")
-@click.argument("target")
+@click.argument("target", callback=_profile_arg_callback)
 @click.option(
     "--since", "since_iso", required=True,
     help="When the failed run started, e.g. 2026-04-30T14:37 (printed on the "
@@ -815,7 +844,7 @@ def preview(conversation_uuid: str, show_payload: bool) -> None:
 
 
 @cli.command(help="Show local archive vs target migration counts (no network calls).")
-@click.argument("target")
+@click.argument("target", callback=_profile_arg_callback)
 def status(target: str) -> None:
     s = migration_status(target)
     archive = s["archive"]
@@ -974,6 +1003,7 @@ def schedule() -> None:
 
 @schedule.command("install", help="Install the daily incremental backup timer.")
 @click.option("--profile", default="source", show_default=True,
+              callback=_profile_arg_callback,
               help="Profile to back up daily.")
 def schedule_install(profile: str) -> None:
     s = install_timer(profile)

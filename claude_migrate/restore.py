@@ -21,12 +21,14 @@ from .client import ClaudeClient
 from .errors import (
     AuthExpired,
     ClaudeMigrateError,
+    ClientVersionStale,
     CloudflareChallenge,
     EndpointChanged,
     NetworkError,
     RateLimited,
     RestoreConflict,
     SchemaDrift,
+    TLSReject,
 )
 from .render import prepare_paste_payload
 from .runner import Pacer, WorkerOutcome, migrate_row
@@ -121,6 +123,8 @@ async def restore_styles(
                 created = await client.post_json(
                     f"/api/organizations/{target_org}/custom_styles", body=body
                 )
+            except RateLimited as e:
+                return WorkerOutcome.failed(f"style: {e}", rate_limited=True)
             except (EndpointChanged, NetworkError) as e:
                 return WorkerOutcome.failed(f"style: {e}")
             new_uuid = created.get("uuid") if isinstance(created, dict) else None
@@ -200,6 +204,8 @@ async def restore_projects(
                             body={"file_name": doc["file_name"], "content": doc["content"]},
                         )
                     return WorkerOutcome.ok(new_uuid)
+                except RateLimited as e:
+                    return WorkerOutcome.failed(f"project: {e}", rate_limited=True)
                 except (EndpointChanged, NetworkError, SchemaDrift) as e:
                     return WorkerOutcome.failed(f"project: {e}")
 
@@ -398,9 +404,10 @@ async def restore_conversation(
 ) -> WorkerOutcome:
     """Migrate one conversation. Returns a WorkerOutcome.
 
-    Lets `AuthExpired` and `CloudflareChallenge` propagate (session-fatal);
-    every other failure turns into `WorkerOutcome.failed(...)`, with cleanup
-    of any half-created target conversation handled inline.
+    Lets session-fatal exceptions (`AuthExpired`, `CloudflareChallenge`,
+    `TLSReject`) propagate after cleanup; every other failure turns into
+    `WorkerOutcome.failed(...)`, with cleanup of any half-created target
+    conversation handled inline.
     """
     payload = prepare_paste_payload(conn, source_conv["uuid"])
     title = source_conv["title"] or "(untitled)"
@@ -431,10 +438,14 @@ async def restore_conversation(
     except NetworkError as e:
         await _cleanup_partial(client, target_org, new_uuid)
         return WorkerOutcome.failed(f"{type(e).__name__}: {e}")
-    except (AuthExpired, CloudflareChallenge):
+    except (AuthExpired, CloudflareChallenge, TLSReject):
+        # Session-fatal: clean up the half-created chat, then re-raise so the
+        # orchestrator stops and surfaces a re-auth instruction.
         await _cleanup_partial(client, target_org, new_uuid)
         raise
-    except (EndpointChanged, SchemaDrift, RestoreConflict) as e:
+    except (ClientVersionStale, EndpointChanged, SchemaDrift, RestoreConflict) as e:
+        # ClientVersionStale: per-row failure (the run can continue; only this
+        # request's body shape was rejected). User can refresh headers and retry.
         await _cleanup_partial(client, target_org, new_uuid)
         return WorkerOutcome.failed(f"{type(e).__name__}: {e}")
 

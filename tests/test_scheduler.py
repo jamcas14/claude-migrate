@@ -111,3 +111,55 @@ def test_detect_backend_returns_known_value() -> None:
     """detect_backend should return one of the supported strings, never crash."""
     backend = scheduler.detect_backend()
     assert backend in {"systemd", "launchd", "task_scheduler", "cron", "unsupported"}
+
+
+def test_systemd_quoting_handles_spaces_in_path() -> None:
+    """A claude-migrate path containing spaces (e.g. `/Users/My Name/.local/bin/`)
+    must be quoted so systemd parses it as one argv token, not three."""
+    quoted = scheduler._shell_quote_for_systemd(
+        ["/Users/My Name/.local/bin/claude-migrate", "--quiet", "backup", "src"]
+    )
+    assert '"/Users/My Name/.local/bin/claude-migrate"' in quoted
+    assert "--quiet backup src" in quoted
+
+
+def test_systemd_quoting_escapes_backslash_and_quote() -> None:
+    quoted = scheduler._shell_quote_for_systemd(["/path/with\"quote", "arg"])
+    assert "\\\"" in quoted  # embedded " is backslash-escaped
+
+
+def test_cron_quoting_single_quotes_special_chars() -> None:
+    """cron lines are POSIX shell; single-quote anything with metacharacters."""
+    quoted = scheduler._shell_quote_for_cron(
+        ["/some/path", "--quiet", "backup", "src;rm-rf"]
+    )
+    # The dangerous src;rm-rf must be in single quotes.
+    assert "'src;rm-rf'" in quoted
+
+
+def test_claude_migrate_argv_returns_list() -> None:
+    """No more `exe.split()` — paths with spaces don't get fragmented."""
+    argv = scheduler._claude_migrate_argv()
+    assert isinstance(argv, list)
+    assert all(isinstance(a, str) for a in argv)
+    assert len(argv) >= 1
+
+
+def test_launchd_install_xml_escapes_special_chars(
+    tmp_path: Path, monkeypatch: object,
+) -> None:
+    """Plist `<string>` content must XML-escape `&`/`<`/`>`/quotes so a path
+    or profile name with these chars doesn't break the plist parser."""
+    monkeypatch.setenv("HOME", str(tmp_path))  # type: ignore[attr-defined]
+    monkeypatch.setenv("CLAUDE_MIGRATE_DATA_DIR", str(tmp_path / "data"))  # type: ignore[attr-defined]
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        scheduler, "_claude_migrate_argv",
+        lambda: ["/path/with&amp"],
+    )
+    with _stub_subprocess():
+        scheduler._launchd_install("normal-name")
+    plist = scheduler._launchd_plist_path().read_text()
+    # Raw `&` in the path must come out as `&amp;` in the plist; otherwise
+    # the plist is malformed.
+    assert "&amp;amp" in plist
+    assert "<string>/path/with&amp;amp</string>" in plist

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -227,3 +228,161 @@ async def test_5xx_uses_capped_backoff_schedule() -> None:
     assert all(t < 61 for t in sleep_calls), f"saw uncapped sleep: {sleep_calls}"
     # Should be at least 2s (start of schedule).
     assert any(t >= 2 for t in sleep_calls)
+
+
+# ---------------------------------------------------------------------------
+# stream() concurrency cap + retry — used by the conversation restore path.
+# ---------------------------------------------------------------------------
+
+
+class _FakeStreamResp:
+    """Async-context-managed response for sess.stream(...). Yields one
+    `data: ...` line so the happy-path consumer sees a terminating event."""
+
+    def __init__(
+        self, status: int, body_lines: list[bytes] | None = None,
+    ) -> None:
+        self.status_code = status
+        self._body_lines = body_lines or [b'data: {"stop_reason": "end_turn"}']
+
+    async def __aenter__(self) -> _FakeStreamResp:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def aiter_lines(self) -> Any:
+        for ln in self._body_lines:
+            yield ln
+
+    async def aiter_content(self) -> Any:
+        for ln in self._body_lines:
+            yield ln
+
+
+class _FakeStreamSession:
+    """Records each stream call. Pops the next prepared response."""
+
+    def __init__(self, *resps: _FakeStreamResp) -> None:
+        self._resps = list(resps)
+        self.stream_call_count = 0
+
+    def stream(self, method: Any, url: Any, **kw: Any) -> _FakeStreamResp:
+        self.stream_call_count += 1
+        return self._resps.pop(0)
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_stream_retries_429_with_backoff_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stream() must follow the same retry policy as request() for 429
+    handshake responses — used to silently fail on first 429."""
+    import claude_migrate.client as cm
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(t: float) -> None:
+        sleeps.append(t)
+
+    monkeypatch.setattr(cm.asyncio, "sleep", fake_sleep)
+    c = _client()
+    c._session = _FakeStreamSession(
+        _FakeStreamResp(429),
+        _FakeStreamResp(429),
+        _FakeStreamResp(200),  # eventual success
+    )
+    lines: list[str] = []
+    async for ln in c.stream("POST", "/api/x"):
+        lines.append(ln)
+    # Two retries before success → two backoff sleeps.
+    assert len(sleeps) == 2
+    assert all(2 <= t < 61 for t in sleeps), f"unexpected sleep durations: {sleeps}"
+    assert lines == ['data: {"stop_reason": "end_turn"}']
+
+
+async def test_stream_429_after_max_retries_raises_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After MAX_RETRIES (3) consecutive 429s, raise RateLimited."""
+    import claude_migrate.client as cm
+    from claude_migrate.errors import RateLimited
+
+    async def fake_sleep(t: float) -> None: ...
+    monkeypatch.setattr(cm.asyncio, "sleep", fake_sleep)
+    c = _client()
+    c._session = _FakeStreamSession(
+        _FakeStreamResp(429), _FakeStreamResp(429),
+        _FakeStreamResp(429), _FakeStreamResp(429),
+    )
+    with pytest.raises(RateLimited):
+        async for _ in c.stream("POST", "/api/x"):
+            pass
+
+
+async def test_stream_5xx_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """5xx handshake response must retry on the same schedule."""
+    import claude_migrate.client as cm
+
+    sleeps: list[float] = []
+    async def fake_sleep(t: float) -> None: sleeps.append(t)
+    monkeypatch.setattr(cm.asyncio, "sleep", fake_sleep)
+    c = _client()
+    c._session = _FakeStreamSession(
+        _FakeStreamResp(503), _FakeStreamResp(200),
+    )
+    async for _ in c.stream("POST", "/api/x"):
+        pass
+    assert len(sleeps) == 1
+
+
+async def test_stream_403_with_cf_marker_raises_cloudflare() -> None:
+    """403 + Cloudflare body → CloudflareChallenge (not TLSReject)."""
+    c = _client()
+    c._session = _FakeStreamSession(
+        _FakeStreamResp(403, body_lines=[b"<title>Just a moment...</title>"]),
+    )
+    with pytest.raises(CloudflareChallenge):
+        async for _ in c.stream("POST", "/api/x"):
+            pass
+
+
+async def test_stream_403_without_cf_marker_raises_tls_reject() -> None:
+    """403 with no CF marker → TLSReject (was always RaiseCloudflareChallenge)."""
+    c = _client()
+    c._session = _FakeStreamSession(
+        _FakeStreamResp(403, body_lines=[b"forbidden"]),
+    )
+    with pytest.raises(TLSReject):
+        async for _ in c.stream("POST", "/api/x"):
+            pass
+
+
+async def test_stream_holds_semaphore_for_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole stream lifetime is gated by self._sem so /completion can't
+    silently bypass the concurrency cap."""
+    c = _client()
+    c._session = _FakeStreamSession(_FakeStreamResp(200))
+    # Drain the semaphore so the stream blocks if it tries to acquire.
+    for _ in range(c._sem._value):
+        await c._sem.acquire()
+    try:
+        # Schedule the stream — it must wait, not proceed.
+        async def consume() -> list[str]:
+            return [ln async for ln in c.stream("POST", "/api/x")]
+
+        task = asyncio.create_task(consume())
+        # Give the event loop time to attempt the acquire.
+        await asyncio.sleep(0)
+        assert not task.done(), "stream proceeded without acquiring _sem"
+    finally:
+        c._sem.release()
+        # Now the stream can complete.
+        await task
+        # Re-fill the semaphore for hygiene.
+        for _ in range(c._sem._value, c._sem._value):
+            pass

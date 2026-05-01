@@ -141,6 +141,54 @@ def test_cleanup_default_until_arithmetic() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Profile-name validation at CLI boundary (defense against schtasks/cron/SQL
+# injection via attacker-controlled profile names).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "; calc.exe",          # cmd separator
+        "name with spaces",    # whitespace
+        "name`whoami`",        # backtick
+        'name"$(whoami)"',     # shell substitution
+        "name|pipe",           # pipe
+        "../etc/passwd",       # path traversal
+        "name\nnewline",       # newline
+        "",                    # empty
+        "a" * 65,              # too long (max 64)
+        "name'quote",          # single quote
+        "name&amp",            # ampersand
+        "name<lt>",            # XML-special
+    ],
+)
+def test_profile_name_rejected(bad_name: str) -> None:
+    """Every profile-arg in the CLI runs a callback that refuses these."""
+    runner = CliRunner()
+    # Use `whoami` since it doesn't try to network-probe before the validator.
+    result = runner.invoke(cli, ["whoami", bad_name])
+    assert result.exit_code != 0, f"input {bad_name!r} unexpectedly accepted"
+    assert "Profile name" in result.output or "invalid" in result.output.lower()
+
+
+@pytest.mark.parametrize(
+    "good_name",
+    ["source", "target", "work", "personal-old", "acme.prod", "user_2024", "a", "A1"],
+)
+def test_profile_name_accepted(good_name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reasonable names pass validation. (whoami still fails downstream because
+    the profile doesn't exist in the keychain, but the callback let it through.)"""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["whoami", good_name])
+    # Callback rejection prints "Profile name X is invalid"; success here
+    # means we got past the callback into the actual command body. The
+    # downstream failure (AuthMissing) gives exit code 2 with a specific
+    # message — either way, we shouldn't see the validator's rejection text.
+    assert "Profile name" not in result.output
+
+
 def test_migrate_dry_run_does_not_open_source_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

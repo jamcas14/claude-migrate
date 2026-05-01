@@ -180,29 +180,47 @@ def test_load_profile_missing_required_fields_raises_authinvalid(
         auth_mod.load_profile("source")
 
 
-def test_list_profiles_continues_through_keyring_errors(
+def test_list_profiles_uses_index_file_as_source_of_truth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A keyring error on one guess must not skip the rest of the loop nor
-    drop the file-fallback profiles."""
-    from keyring.errors import NoKeyringError
-
+    """list_profiles reads the plaintext index file written by store_profile,
+    so profile names like `acme-prod` show up regardless of keychain enumeration
+    (which has no list API)."""
     from claude_migrate import auth as auth_mod
 
-    seen: list[str] = []
-
-    def flaky_get(service: str, name: str) -> str | None:
-        seen.append(name)
-        if name == "source":
-            raise NoKeyringError("simulated transient")
-        if name == "target":
-            return '{"session_key": "x", "cf_clearance": "y"}'
-        return None
-
-    monkeypatch.setattr(auth_mod.keyring, "get_password", flaky_get)
+    monkeypatch.setattr(auth_mod, "_index_load", lambda: {"acme-prod", "personal"})
     monkeypatch.setattr(auth_mod, "_fallback_blob_load_or_empty", lambda: {})
     names = auth_mod.list_profiles()
-    # Must have probed past `source` despite the error.
-    assert "target" in names
-    assert "source" in seen
-    assert "target" in seen
+    assert names == ["acme-prod", "personal"]
+
+
+def test_list_profiles_unions_fallback_file_for_legacy_installs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback-file keys are unioned in so installs that predate the index
+    file still surface their profiles."""
+    from claude_migrate import auth as auth_mod
+
+    monkeypatch.setattr(auth_mod, "_index_load", lambda: set())
+    monkeypatch.setattr(
+        auth_mod, "_fallback_blob_load_or_empty",
+        lambda: {"legacy": {"session_key": "x", "cf_clearance": "y"}},
+    )
+    names = auth_mod.list_profiles()
+    assert "legacy" in names
+
+
+def test_list_profiles_tolerates_corrupt_fallback_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bad passphrase or corrupted secrets file shouldn't make `accounts` fail."""
+    from claude_migrate import auth as auth_mod
+    from claude_migrate.errors import AuthInvalid
+
+    def boom() -> dict[str, dict[str, str]]:
+        raise AuthInvalid("simulated decrypt failure")
+
+    monkeypatch.setattr(auth_mod, "_index_load", lambda: {"primary"})
+    monkeypatch.setattr(auth_mod, "_fallback_blob_load_or_empty", boom)
+    names = auth_mod.list_profiles()
+    assert names == ["primary"]

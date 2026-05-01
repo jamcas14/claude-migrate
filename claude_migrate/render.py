@@ -7,12 +7,17 @@ keeps the wire format next to the chunking / sizing strategy that produced it.
 
 from __future__ import annotations
 
+import gzip
 import json
 import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Any
 from xml.sax.saxutils import escape as xml_escape
+
+import structlog
+
+log = structlog.get_logger(__name__)
 
 ARTIFACT_RE = re.compile(
     r"<antArtifact\s+([^>]*?)>(.*?)</antArtifact>",
@@ -294,12 +299,17 @@ def render_transcript(conn: sqlite3.Connection, conv_uuid: str) -> str:
     raw_path = crow["raw_path"]
     raw: dict[str, Any] = {}
     if raw_path:
-        import gzip
         try:
             with gzip.open(raw_path, "rb") as f:
                 raw = json.loads(f.read().decode("utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = {}
+        except (OSError, json.JSONDecodeError) as e:
+            # Don't silently lose content. The fall-through reconstructs
+            # messages from the SQLite `message` table; warn so the user
+            # knows the raw sidecar is unreadable and can investigate.
+            log.warning(
+                "transcript_raw_unreadable",
+                uuid=conv_uuid, path=raw_path, err=str(e),
+            )
 
     messages: list[dict[str, Any]] = list(raw.get("chat_messages") or [])
     if not messages:
@@ -308,7 +318,10 @@ def render_transcript(conn: sqlite3.Connection, conv_uuid: str) -> str:
             "ORDER BY index_in_conversation ASC, created_at ASC",
             (conv_uuid,),
         ).fetchall()
-        messages = [json.loads(r["raw"]) for r in rows if r["raw"]]
+        # Filter to dict-shaped rows with a uuid: a corrupt JSON blob would
+        # otherwise blow up _flatten_branch downstream.
+        candidates = [json.loads(r["raw"]) for r in rows if r["raw"]]
+        messages = [m for m in candidates if isinstance(m, dict) and "uuid" in m]
 
     leaf = raw.get("current_leaf_message_uuid")
     chain = _flatten_branch(messages, leaf)

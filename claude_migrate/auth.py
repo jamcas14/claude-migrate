@@ -41,6 +41,22 @@ from .errors import (
 SESSION_KEY_PREFIX: Final = "sk-ant-sid"
 """Stem prefix. Anthropic increments the trailing digits over time (sid01, sid02, ...)."""
 
+# Profile names are passed to systemd ExecStart, schtasks /TR, cron lines,
+# launchd ProgramArguments, and SQL parameters. Restricting them keeps the
+# scheduler subprocess + filesystem paths injection-safe.
+PROFILE_NAME_RE: Final = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def validate_profile_name(name: str) -> None:
+    """Raise AuthInvalid if `name` contains characters that could leak into
+    shell/scheduler subprocess arguments. Also caps length at 64 chars."""
+    if not PROFILE_NAME_RE.match(name):
+        raise AuthInvalid(
+            f"Profile name {name!r} is invalid. Allowed: letters, digits, "
+            "`.`, `_`, `-` (1-64 chars). Profile names are interpolated into "
+            "scheduler arguments and SQL keys, so we restrict them at the boundary."
+        )
+
 SESSION_KEY_PREFIX_RE: Final = re.compile(r"^sk-ant-sid\d{2,}-")
 SESSION_KEY_RE: Final = re.compile(r"^sk-ant-sid\d{2,}-[A-Za-z0-9_-]+$")
 CF_CLEARANCE_RE: Final = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -190,11 +206,84 @@ def _fallback_path() -> Path:
     return config_dir() / "secrets.enc.json"
 
 
+def _index_path() -> Path:
+    """Plaintext index of profile names. No secrets — just names — so we can
+    enumerate `list_profiles()` truthfully regardless of whether each profile
+    landed in the OS keychain or the encrypted file fallback."""
+    return config_dir() / "profiles.index"
+
+
+def _index_load() -> set[str]:
+    p = _index_path()
+    if not p.exists():
+        return set()
+    try:
+        return {
+            ln.strip() for ln in p.read_text("utf-8").splitlines() if ln.strip()
+        }
+    except OSError:
+        return set()
+
+
+def _index_save(names: set[str]) -> None:
+    p = _index_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(sorted(names)) + ("\n" if names else "")
+    # Atomic replace, like the secrets file.
+    tmp = p.with_name(p.name + f".tmp-{os.getpid()}")
+    tmp.write_text(body, "utf-8")
+    os.replace(tmp, p)
+
+
+def _index_add(name: str) -> None:
+    names = _index_load()
+    if name not in names:
+        names.add(name)
+        _index_save(names)
+
+
+def _index_remove(name: str) -> None:
+    names = _index_load()
+    if name in names:
+        names.discard(name)
+        _index_save(names)
+
+
+# scrypt: n=2**17 (128 MiB) ≈ OWASP 2023+ recommendation. Higher than the
+# previous n=2**14, which was OWASP's *minimum* — these credentials are
+# long-lived and unmasking them costs Anthropic-account access.
+_SCRYPT_N: Final = 2**17
+_SCRYPT_R: Final = 8
+_SCRYPT_P: Final = 1
+
+
 def _derive_key(passphrase: str, salt: bytes) -> bytes:
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
-    kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
+    kdf = Scrypt(salt=salt, length=32, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P)
     return kdf.derive(passphrase.encode("utf-8"))
+
+
+# Cached process-local passphrase. Once the user has typed it, every save in
+# the same `claude-migrate` invocation reuses it — otherwise a single CLI
+# command that touches multiple profiles re-prompts for "set a passphrase"
+# (UX bug) and re-derives a new key for each file rewrite.
+_cached_passphrase: str | None = None
+
+
+def _get_or_prompt_passphrase(*, prompt: str, confirming: bool = False) -> str:
+    global _cached_passphrase
+    if _cached_passphrase is not None:
+        return _cached_passphrase
+    pp = getpass.getpass(prompt)
+    if confirming:
+        if len(pp) < 8:
+            raise AuthInvalid("Passphrase too short — use at least 8 characters.")
+        pp2 = getpass.getpass("Confirm passphrase: ")
+        if pp != pp2:
+            raise AuthInvalid("Passphrases did not match.")
+    _cached_passphrase = pp
+    return pp
 
 
 def _fallback_blob_load() -> dict[str, dict[str, str]]:
@@ -205,7 +294,9 @@ def _fallback_blob_load() -> dict[str, dict[str, str]]:
     salt = base64.b64decode(raw["salt"])
     nonce = base64.b64decode(raw["nonce"])
     ct = base64.b64decode(raw["ct"])
-    pp = getpass.getpass("Passphrase for claude-migrate secrets file: ")
+    pp = _get_or_prompt_passphrase(
+        prompt="Passphrase for claude-migrate secrets file: "
+    )
     key = _derive_key(pp, salt)
     pt = AESGCM(key).decrypt(nonce, ct, None)
     parsed: Any = json.loads(pt.decode("utf-8"))
@@ -217,35 +308,64 @@ def _fallback_blob_load() -> dict[str, dict[str, str]]:
 def _fallback_blob_save(blob: dict[str, dict[str, str]]) -> None:
     p = _fallback_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    pp = getpass.getpass("Set a passphrase to encrypt the secrets file: ")
-    if len(pp) < 8:
-        raise AuthInvalid("Passphrase too short — use at least 8 characters.")
-    pp2 = getpass.getpass("Confirm passphrase: ")
-    if pp != pp2:
-        raise AuthInvalid("Passphrases did not match.")
+    # First save in this process? Confirm. Subsequent saves reuse the cached
+    # passphrase — no re-prompt.
+    pp = _get_or_prompt_passphrase(
+        prompt="Set a passphrase to encrypt the secrets file: ",
+        confirming=_cached_passphrase is None,
+    )
     salt = secrets.token_bytes(16)
     nonce = secrets.token_bytes(12)
     key = _derive_key(pp, salt)
     pt = json.dumps(blob).encode("utf-8")
     ct = AESGCM(key).encrypt(nonce, pt, None)
-    p.write_text(
-        json.dumps(
-            {
-                "salt": base64.b64encode(salt).decode("ascii"),
-                "nonce": base64.b64encode(nonce).decode("ascii"),
-                "ct": base64.b64encode(ct).decode("ascii"),
-            }
-        ),
-        "utf-8",
+    body = json.dumps(
+        {
+            "salt": base64.b64encode(salt).decode("ascii"),
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "ct": base64.b64encode(ct).decode("ascii"),
+        }
     )
-    with contextlib.suppress(OSError):
-        os.chmod(p, 0o600)
+    # Atomic write: open a sibling tempfile with restrictive perms, write +
+    # fsync, then os.replace. Avoids the umask-default-mode race window that
+    # `Path.write_text` + chmod-after had.
+    tmp = p.with_name(p.name + f".tmp-{os.getpid()}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    # O_NOFOLLOW is POSIX-only — `getattr` keeps mypy happy on Windows where
+    # the constant doesn't exist in os.* (the `os.name != "nt"` guard alone
+    # isn't enough; mypy's stub doesn't know about runtime branching).
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    os.replace(tmp, p)
+    if os.name != "nt":
+        # Atomic create-with-mode set 0600 already; this is belt-and-braces
+        # in case some platform's umask interfered. Surface failure on Linux/
+        # macOS where 0600 is meaningful so the user knows the file may be
+        # readable by other local users.
+        try:
+            os.chmod(p, 0o600)
+        except OSError as e:
+            print(
+                f"warning: could not set 0600 perms on {p}: {e}. "
+                "Other local users may be able to read your encrypted secrets.",
+                file=sys.stderr,
+            )
 
 
 def store_profile(name: str, profile: Profile) -> None:
     payload = json.dumps(asdict(profile))
     try:
         keyring.set_password(KEYRING_SERVICE, name, payload)
+        _index_add(name)
         return
     except (NoKeyringError, KeyringError):
         pass
@@ -257,6 +377,7 @@ def store_profile(name: str, profile: Profile) -> None:
     blob = _fallback_blob_load_or_empty()
     blob[name] = json.loads(payload)
     _fallback_blob_save(blob)
+    _index_add(name)
 
 
 def _fallback_blob_load_or_empty() -> dict[str, dict[str, str]]:
@@ -315,22 +436,28 @@ def remove_profile(name: str) -> None:
             with contextlib.suppress(FileNotFoundError):
                 _fallback_path().unlink()
         removed = True
+    # Always clean up the index, regardless of where the profile lived.
+    if name in _index_load():
+        _index_remove(name)
+        removed = True
     if not removed:
         raise AuthMissing(f"No profile named {name!r} to remove.")
 
 
 def list_profiles() -> list[str]:
-    """Best-effort enumeration. keyring has no list API — we read the fallback file
-    plus probe a small set of conventional names from the keychain. A keyring
-    error on one guess does not skip the rest; we always merge in fallback-file
-    profiles even if every keyring probe fails."""
-    names: set[str] = set(_fallback_blob_load_or_empty().keys())
-    for guess in ("source", "target", "personal", "work"):
-        try:
-            if keyring.get_password(KEYRING_SERVICE, guess):
-                names.add(guess)
-        except (NoKeyringError, KeyringError):
-            continue
+    """Enumerate stored profiles.
+
+    Source of truth is the plaintext `profiles.index` file written on every
+    `store_profile` / `remove_profile` — this lets us list profiles by their
+    real name (`acme-prod`, `personal-old`, etc.) instead of probing a fixed
+    set of hardcoded guesses. The fallback-file keys are also unioned in so
+    legacy installs predating the index file still surface their profiles.
+    """
+    names: set[str] = _index_load()
+    # Union legacy: fallback-file keys (covers pre-index installs). Bad
+    # passphrase or corrupted file shouldn't fail the listing.
+    with contextlib.suppress(AuthInvalid):
+        names.update(_fallback_blob_load_or_empty().keys())
     return sorted(names)
 
 
