@@ -52,6 +52,11 @@ class RestoreSummary:
     skipped: int = 0
     failed: list[tuple[str, str]] = field(default_factory=list)
     dry_run: bool = False
+    cascade_aborted: bool = False
+    """True when the conversation phase detected a rate-limit cascade and
+    bailed early to avoid creating more orphan empty chats. Surfaced by the
+    CLI summary so the user sees a specific recovery message instead of the
+    generic 'Re-run to retry'."""
 
     def record_failure(self, source_uuid: str, label: str) -> None:
         self.failed.append((source_uuid, label))
@@ -623,6 +628,14 @@ async def restore_all_conversations(
     # ~12min (3 attempts x 1 cooldown each) to ~6min.
     max_attempts = 2
 
+    # Cascade-abort threshold. If we see this many consecutive rate_limited
+    # outcomes (no successes in between), the account is being throttled at
+    # a level no client-side pacing can fix in this run. Continuing burns
+    # orphan empty chats on target for zero progress; instead we abort with
+    # a clear message and let the user re-run later (idempotent) or switch
+    # to --archive-only.
+    CASCADE_ABORT_THRESHOLD = 5
+
     async def one(idx: int, row: sqlite3.Row) -> None:
         source_uuid = row["uuid"]
         title = (row["title"] or "(untitled)")[:60]
@@ -686,8 +699,28 @@ async def restore_all_conversations(
             )
             await pacer.after(outcome)
 
+    def _check_cascade() -> bool:
+        """Return True if the migration should abort due to a rate-limit
+        cascade. Logs a single high-visibility error message the first time
+        the threshold trips."""
+        if pacer.consecutive_rate_limits >= CASCADE_ABORT_THRESHOLD:
+            log.error(
+                "rate_limit_cascade_abort",
+                consecutive=pacer.consecutive_rate_limits,
+                hint=(
+                    "Account is fully rate-limited; aborting to avoid "
+                    "creating more orphan empty chats on target. Re-run "
+                    "later (idempotent) or switch to --archive-only."
+                ),
+            )
+            return True
+        return False
+
     if concurrency <= 1:
         for idx, row in enumerate(rows):
+            if _check_cascade():
+                summary.cascade_aborted = True
+                return
             await one(idx, row)
         return
 
@@ -695,6 +728,12 @@ async def restore_all_conversations(
 
     async def gated(idx: int, row: sqlite3.Row) -> None:
         async with sem:
+            # Check before AND after the worker runs so concurrency>1 also
+            # bails out promptly once the cascade is detected — the in-flight
+            # workers will finish their current chat then this guard skips
+            # the rest.
+            if _check_cascade():
+                return
             await one(idx, row)
 
     # return_exceptions=True so an unhandled exception in one worker doesn't
@@ -708,3 +747,5 @@ async def restore_all_conversations(
     for res in results:
         if isinstance(res, AuthExpired | CloudflareChallenge | TLSReject):
             raise res
+    if pacer.consecutive_rate_limits >= CASCADE_ABORT_THRESHOLD:
+        summary.cascade_aborted = True

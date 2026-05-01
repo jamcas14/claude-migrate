@@ -795,7 +795,30 @@ def migrate(
         click.echo(f"\n  failures: {len(failed)} — first few:")
         for src_uuid, err in failed[:5]:
             click.echo(f"    {src_uuid[:8]} → {err}")
-        click.echo(f"  Re-run `claude-migrate migrate {source} {target}` to retry.")
+        if summary.cascade_aborted:
+            # Cascade-abort got us here. Don't tell the user "just re-run" —
+            # the same thing will happen. Surface the actual escape paths.
+            click.echo(
+                "\n  ⚠ Migration stopped early because every recent chat hit "
+                "a rate limit (account-side throttle). Continuing would only "
+                "create more orphan empty chats on target."
+            )
+            click.echo("  Recovery options, in order of speed:")
+            click.echo(
+                f"    1. `claude-migrate migrate {source} {target} --archive-only` "
+                "— skips /completion entirely, finishes in minutes."
+            )
+            click.echo(
+                f"    2. Wait several hours for the rate-limit window to "
+                f"recover, then re-run `claude-migrate migrate {source} "
+                f"{target}` (idempotent)."
+            )
+            click.echo(
+                f"    3. Sweep orphan empty chats from target: "
+                f"`claude-migrate cleanup {target} --since <when-this-run-started>`"
+            )
+        else:
+            click.echo(f"  Re-run `claude-migrate migrate {source} {target}` to retry.")
 
     # Step 4 (optional): reorder
     if conversations and not skip_reorder and not failed:

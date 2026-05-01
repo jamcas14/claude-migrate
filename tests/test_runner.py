@@ -230,6 +230,110 @@ async def test_pacer_cooldown_uses_fixed_floor_when_no_retry_after() -> None:
     assert pause_seen == [100.0, 100.0, 100.0, 100.0]
 
 
+async def test_pacer_cooldown_ignores_tiny_retry_after_in_favor_of_floor() -> None:
+    """Anthropic was observed sending `Retry-After: 0` on consumer 429s — a
+    spec-compliant placeholder that's useless for actual pacing. Trusting it
+    produces tight retry loops. Pacer must floor the cooldown at the
+    `rate_limit_min_floor` (10s default) regardless of how small the server's
+    hint is."""
+    fake_now = [1000.0]
+    pause_seen: list[float] = []
+
+    async def fake_sleep(t: float) -> None:
+        pause_seen.append(t)
+        fake_now[0] += t
+
+    class FakeLoop:
+        def time(self) -> float:
+            return fake_now[0]
+
+    real_sleep = asyncio.sleep
+    real_get_loop = asyncio.get_running_loop
+    asyncio.sleep = fake_sleep  # type: ignore[assignment]
+    asyncio.get_running_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
+    try:
+        pacer = Pacer(
+            base_sleep_sec=60.0, rate_limit_sleep_sec=300.0,
+            base_min=5.0, rate_limit_min_floor=10.0,
+        )
+        # Server sends Retry-After: 0 — Pacer must NOT cool down for 0s.
+        await pacer.after(WorkerOutcome.failed(
+            "429", rate_limited=True, retry_after_sec=0.0,
+        ))
+        await pacer.before()
+    finally:
+        asyncio.sleep = real_sleep  # type: ignore[assignment]
+        asyncio.get_running_loop = real_get_loop  # type: ignore[assignment]
+    # 10s floor honored, not 0s from server.
+    assert pause_seen == [10.0]
+
+
+async def test_pacer_cooldown_uses_aimd_base_when_higher_than_server_hint() -> None:
+    """If AIMD has ramped up `current_base` above the server's Retry-After
+    hint, use AIMD's value — we've learned the server actually wants longer
+    waits than its own header is admitting."""
+    fake_now = [1000.0]
+    pause_seen: list[float] = []
+
+    async def fake_sleep(t: float) -> None:
+        pause_seen.append(t)
+        fake_now[0] += t
+
+    class FakeLoop:
+        def time(self) -> float:
+            return fake_now[0]
+
+    real_sleep = asyncio.sleep
+    real_get_loop = asyncio.get_running_loop
+    asyncio.sleep = fake_sleep  # type: ignore[assignment]
+    asyncio.get_running_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
+    try:
+        pacer = Pacer(
+            base_sleep_sec=60.0, rate_limit_sleep_sec=300.0,
+            base_min=5.0, rate_limit_min_floor=10.0,
+        )
+        # Each rate-limited outcome doubles current_base (5→10→20→40→60-cap)
+        # AND uses cooldown = max(retry_after, current_base, floor).
+        # Server's tiny 2s hint should never produce a 2s cooldown.
+        for _ in range(4):
+            await pacer.after(WorkerOutcome.failed(
+                "429", rate_limited=True, retry_after_sec=2.0,
+            ))
+            await pacer.before()
+    finally:
+        asyncio.sleep = real_sleep  # type: ignore[assignment]
+        asyncio.get_running_loop = real_get_loop  # type: ignore[assignment]
+    # AIMD trajectory: 10, 20, 40, 60 (capped at base_sleep_sec).
+    # Cooldown follows current_base, not the 2s server hint.
+    assert pause_seen == [10.0, 20.0, 40.0, 60.0]
+    assert all(p > 2.0 for p in pause_seen), (
+        f"server's 2s Retry-After must NOT win over AIMD: {pause_seen}"
+    )
+
+
+async def test_pacer_consecutive_rate_limits_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Pacer exposes consecutive_rate_limits so the conversation loop
+    can detect a rate-limit cascade and abort instead of burning more
+    orphan target chats."""
+    pacer = Pacer(base_sleep_sec=10.0, rate_limit_sleep_sec=30.0)
+    assert pacer.consecutive_rate_limits == 0
+
+    async def noop_sleep(t: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", noop_sleep)
+    await pacer.after(WorkerOutcome.failed("x", rate_limited=True))
+    assert pacer.consecutive_rate_limits == 1
+    await pacer.after(WorkerOutcome.failed("x", rate_limited=True))
+    await pacer.after(WorkerOutcome.failed("x", rate_limited=True))
+    assert pacer.consecutive_rate_limits == 3
+    # A success resets the counter.
+    await pacer.after(WorkerOutcome.ok("y"))
+    assert pacer.consecutive_rate_limits == 0
+
+
 async def test_pacer_cooldown_honors_retry_after_when_present() -> None:
     """Server-sent Retry-After overrides the configured `rate_limit_sleep_sec`
     floor — usually shorter (30-90s) than our 300s default."""

@@ -69,6 +69,74 @@ async def test_restore_profile_prefs_swallows_recoverable_errors(
     assert result is False  # logged + skipped, no raise
 
 
+async def test_restore_all_conversations_cascade_aborts_on_repeated_429(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When 5 consecutive chats hit rate-limit (no successes between),
+    bail out instead of creating more orphan empty chats on target."""
+    from claude_migrate.client import Credentials
+    from claude_migrate.config import load_settings
+    from claude_migrate.restore import RestoreSummary, restore_all_conversations
+    from claude_migrate.store import upsert_conversation
+
+    # Seed 10 conversations in source archive.
+    for i in range(10):
+        upsert_conversation(db_conn, "o1", {
+            "uuid": f"c{i}", "name": f"Chat {i}",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": f"2024-01-{i + 1:02d}T00:00:00Z",
+        })
+    state = RestoreState(db_conn, "tgt")
+    summary = RestoreSummary()
+
+    # Stub Pacer so cooldown doesn't actually sleep.
+    import claude_migrate.restore as restore_mod
+
+    class _NopPacer:
+        def __init__(self, **kw: object) -> None:
+            self.consecutive_rate_limits = 0
+
+        async def before(self) -> None:
+            return None
+
+        async def after(self, outcome: object) -> None:
+            if outcome is not None and getattr(outcome, "rate_limited", False):
+                self.consecutive_rate_limits += 1
+            elif outcome is not None and getattr(outcome, "target_uuid", None):
+                self.consecutive_rate_limits = 0
+
+    monkeypatch.setattr(restore_mod, "Pacer", _NopPacer)
+
+    # Stub restore_conversation to always rate-limit.
+    async def fake_restore_conversation(
+        client: object, conn: object, target_org: object,
+        source_conv: object, project_map: object,
+    ) -> object:
+        from claude_migrate.runner import WorkerOutcome
+        return WorkerOutcome.failed("429", rate_limited=True)
+
+    monkeypatch.setattr(
+        restore_mod, "restore_conversation", fake_restore_conversation,
+    )
+
+    # Build a real ClaudeClient so settings.chat_sleep_sec is reachable, but
+    # nothing should hit the network — restore_conversation is stubbed.
+    from claude_migrate.client import ClaudeClient
+    client = ClaudeClient(
+        Credentials(session_key="sk-ant-sid01-X", cf_clearance="cf-X"),
+        load_settings(),
+    )
+
+    await restore_all_conversations(
+        client, db_conn, "tgt-org", state, project_map={},
+        dry_run=False, summary=summary, concurrency=1,
+    )
+    assert summary.cascade_aborted is True
+    # Bailed early, so far fewer than 10 chats were attempted.
+    # Threshold is 5; loop checks BEFORE each chat, so attempts = 5, not 10.
+    assert len(summary.failed) <= 5
+
+
 async def test_restore_profile_prefs_filters_internal_settings_keys(
     db_conn: sqlite3.Connection,
 ) -> None:

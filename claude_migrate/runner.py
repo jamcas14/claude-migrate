@@ -126,8 +126,16 @@ class Pacer:
     max_cooldown_sec: float = 600.0
     """Upper clamp on a single cooldown window."""
 
+    rate_limit_min_floor: float = 10.0
+    """Hard minimum cooldown when ANY 429 hits. Anthropic occasionally sends
+    `Retry-After: 0` (a spec-compliant placeholder, not a useful hint) which
+    the parser surfaces as a tiny number; trusting it produces tight 429-retry
+    loops that achieve nothing. We refuse to retry faster than this floor
+    regardless of what the server says."""
+
     _current_base: float = field(default=0.0, init=False)
     _consecutive_successes: int = field(default=0, init=False)
+    _consecutive_rate_limits: int = field(default=0, init=False)
     _pause_until: float = field(default=0.0, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
@@ -146,6 +154,13 @@ class Pacer:
             log.info("rate_limit_wait", sleep_sec=round(wait, 1))
             await asyncio.sleep(wait)
 
+    @property
+    def consecutive_rate_limits(self) -> int:
+        """Number of rate-limited outcomes since the last success. Callers
+        use this to detect rate-limit cascades (every chat 429ing) and abort
+        instead of wasting more attempts."""
+        return self._consecutive_rate_limits
+
     async def after(self, outcome: WorkerOutcome | None) -> None:
         """Record outcome state and sleep the adaptive base on success."""
         if outcome is None:
@@ -153,18 +168,31 @@ class Pacer:
         if outcome.rate_limited:
             async with self._lock:
                 self._consecutive_successes = 0
+                self._consecutive_rate_limits += 1
                 # AIMD: multiplicative increase on the per-success sleep,
                 # capped at the user's configured `base_sleep_sec` ceiling.
                 self._current_base = min(self._current_base * 2, self.base_sleep_sec)
                 if self._current_base < self.base_min:
                     self._current_base = self.base_min
-                # Cooldown floor: server's Retry-After if available, else
-                # the configured fixed value. Clamp to max_cooldown_sec.
-                cooldown_raw = (
-                    outcome.retry_after_sec
-                    if outcome.retry_after_sec is not None
-                    else self.rate_limit_sleep_sec
-                )
+                # Cooldown logic. Three signals, in order of trust:
+                #   - Server's Retry-After header (if present and reasonable)
+                #   - AIMD's _current_base (what we've learned the server tolerates)
+                #   - rate_limit_min_floor (hard floor; defends against
+                #     `Retry-After: 0` and similar nonsense values)
+                # Take the maximum of all available signals, then clamp to
+                # max_cooldown_sec. If the server gives no hint, default to
+                # the configured fixed `rate_limit_sleep_sec`.
+                if outcome.retry_after_sec is not None:
+                    cooldown_raw = max(
+                        outcome.retry_after_sec,
+                        self._current_base,
+                        self.rate_limit_min_floor,
+                    )
+                else:
+                    cooldown_raw = max(
+                        self.rate_limit_sleep_sec,
+                        self._current_base,
+                    )
                 cooldown = min(cooldown_raw, self.max_cooldown_sec)
                 pause_until = asyncio.get_running_loop().time() + cooldown
                 if pause_until > self._pause_until:
@@ -174,10 +202,12 @@ class Pacer:
                     cooldown_sec=cooldown,
                     retry_after_from_server=outcome.retry_after_sec,
                     next_base_sleep=self._current_base,
+                    consecutive_rate_limits=self._consecutive_rate_limits,
                 )
             return
         async with self._lock:
             self._consecutive_successes += 1
+            self._consecutive_rate_limits = 0
             # AIMD: multiplicative decrease after a streak. The ÷1.5 lets the
             # controller probe for a faster steady state while still backing
             # off quickly when the server pushes back.
