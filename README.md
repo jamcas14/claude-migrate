@@ -98,6 +98,13 @@ Profiles are arbitrary strings (`source`, `target`, `work`, `personal-old`, …)
 
 The same fields can be set via environment variables — `CLAUDE_MIGRATE_CLIENT_VERSION`, `CLAUDE_MIGRATE_CLIENT_SHA`, `CLAUDE_MIGRATE_ANONYMOUS_ID`, `CLAUDE_MIGRATE_DEVICE_ID`, `CLAUDE_MIGRATE_CHAT_SLEEP_SEC`. Env vars override `config.toml`.
 
+**Data location.** The local SQLite archive + raw transcripts live in your platform's user data directory:
+- Linux: `$XDG_DATA_HOME/claude-migrate` (default `~/.local/share/claude-migrate`)
+- macOS: `~/Library/Application Support/claude-migrate`
+- Windows: `%LOCALAPPDATA%\claude-migrate`
+
+Override via `CLAUDE_MIGRATE_DATA_DIR=/some/path`. Run `claude-migrate doctor` to see the resolved path.
+
 ### Memory
 
 | Command | What it does |
@@ -286,7 +293,6 @@ claude_migrate/
 ├── notify.py      # ntfy / osascript / Windows toast on failures
 ├── scheduler.py   # OS-native daily timer install/uninstall
 ├── checkpoint.py  # last_seen_updated_at + content-hash dedup
-├── models.py      # Pydantic v2 models with extra="allow"
 ├── errors.py      # Typed exception hierarchy (AuthExpired, RateLimited, …)
 └── cli.py         # Click commands (verb-first, positional args)
 ```

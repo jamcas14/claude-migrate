@@ -224,3 +224,85 @@ def test_list_profiles_tolerates_corrupt_fallback_file(
     monkeypatch.setattr(auth_mod, "_fallback_blob_load_or_empty", boom)
     names = auth_mod.list_profiles()
     assert names == ["primary"]
+
+
+def test_fallback_blob_load_wraps_invalid_tag_as_auth_invalid(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wrong passphrase should raise AuthInvalid, not propagate InvalidTag."""
+    import base64
+    import json as json_mod
+    import secrets
+
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    from claude_migrate import auth as auth_mod
+    from claude_migrate.errors import AuthInvalid
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    # Encrypt under one key, attempt decrypt under another → InvalidTag.
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(12)
+    key = auth_mod._derive_key("correct-passphrase", salt)
+    ct = AESGCM(key).encrypt(nonce, b'{"x": "y"}', None)
+    auth_mod._fallback_path().parent.mkdir(parents=True, exist_ok=True)
+    auth_mod._fallback_path().write_text(
+        json_mod.dumps({
+            "salt": base64.b64encode(salt).decode(),
+            "nonce": base64.b64encode(nonce).decode(),
+            "ct": base64.b64encode(ct).decode(),
+        }),
+        "utf-8",
+    )
+    auth_mod._cached_passphrase = "wrong-passphrase"
+    try:
+        with pytest.raises(AuthInvalid, match="Wrong passphrase"):
+            auth_mod._fallback_blob_load()
+        # Cache must be cleared so a retry isn't poisoned.
+        assert auth_mod._cached_passphrase is None
+    finally:
+        auth_mod._cached_passphrase = None
+
+
+def test_fallback_blob_load_wraps_malformed_json_as_auth_invalid(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Truncated or hand-edited file → AuthInvalid (not raw JSONDecodeError)."""
+    from claude_migrate import auth as auth_mod
+    from claude_migrate.errors import AuthInvalid
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    auth_mod._fallback_path().parent.mkdir(parents=True, exist_ok=True)
+    auth_mod._fallback_path().write_text("{not valid json", "utf-8")
+    with pytest.raises(AuthInvalid, match="unreadable"):
+        auth_mod._fallback_blob_load()
+
+
+def test_fallback_blob_load_wraps_missing_keys_as_auth_invalid(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON file missing salt/nonce/ct → AuthInvalid."""
+    from claude_migrate import auth as auth_mod
+    from claude_migrate.errors import AuthInvalid
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    auth_mod._fallback_path().parent.mkdir(parents=True, exist_ok=True)
+    auth_mod._fallback_path().write_text('{"salt": "abc"}', "utf-8")
+    with pytest.raises(AuthInvalid, match="unreadable"):
+        auth_mod._fallback_blob_load()
+
+
+def test_index_save_is_atomic_and_fsynced(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_index_save writes through a tempfile and fsyncs before replace."""
+    from claude_migrate import auth as auth_mod
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    auth_mod._index_save({"alpha", "beta"})
+    p = auth_mod._index_path()
+    assert p.exists()
+    assert p.read_text("utf-8") == "alpha\nbeta\n"
+    # Tempfile cleanup
+    siblings = list(p.parent.glob(f"{p.name}.tmp-*"))
+    assert siblings == [], f"leftover tempfiles: {siblings}"

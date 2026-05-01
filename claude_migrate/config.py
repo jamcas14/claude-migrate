@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import Field
@@ -57,10 +59,47 @@ def config_dir() -> Path:
 
 
 def data_dir() -> Path:
-    """Cross-platform data directory. Override via CLAUDE_MIGRATE_DATA_DIR."""
+    """Cross-platform data directory.
+
+    Override priority:
+      1. `CLAUDE_MIGRATE_DATA_DIR` env var (explicit, wins).
+      2. Per-OS XDG-style default:
+         * Linux:  `$XDG_DATA_HOME/claude-migrate` or `~/.local/share/claude-migrate`
+         * macOS:  `~/Library/Application Support/claude-migrate`
+         * Windows: `%LOCALAPPDATA%\\claude-migrate` (or `~/AppData/Local/...`)
+
+    Defaulting to `Path.cwd() / "data"` was a footgun: invoking the CLI from
+    different working directories silently used different SQLite archives,
+    and the systemd timer's `WorkingDirectory` snapshot then diverged from
+    where the user normally ran the tool.
+    """
     if env := os.environ.get("CLAUDE_MIGRATE_DATA_DIR"):
         return Path(env)
-    return Path.cwd() / "data"
+    # Dict-keyed lookup defeats mypy's `sys.platform`/`os.name` narrowing —
+    # otherwise the non-host branches get flagged unreachable on each
+    # `--platform` mypy pass. Same trick as scheduler.detect_backend.
+    return _DATA_DIR_RESOLVERS.get(sys.platform, _xdg_data_dir)()
+
+
+def _windows_data_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(base) / "claude-migrate"
+
+
+def _macos_data_dir() -> Path:
+    return Path.home() / "Library" / "Application Support" / "claude-migrate"
+
+
+def _xdg_data_dir() -> Path:
+    if env := os.environ.get("XDG_DATA_HOME"):
+        return Path(env) / "claude-migrate"
+    return Path.home() / ".local" / "share" / "claude-migrate"
+
+
+_DATA_DIR_RESOLVERS: dict[str, Callable[[], Path]] = {
+    "win32": _windows_data_dir,
+    "darwin": _macos_data_dir,
+}
 
 
 class Settings(BaseSettings):
@@ -89,7 +128,10 @@ class Settings(BaseSettings):
     """Per-browser-session UUID. Optional passthrough."""
 
     base_url: str = Field(default=BASE_URL)
-    concurrency: int = Field(default=CONCURRENCY, ge=1, le=10)
+    # Hard cap of 5 matches the Click `--concurrency` flag and the README's
+    # documented limit; raising it above 5 trips Cloudflare burst-detection
+    # on real consumer accounts.
+    concurrency: int = Field(default=CONCURRENCY, ge=1, le=5)
     chat_sleep_sec: float = Field(default=RESTORE_CHAT_SLEEP_SEC, ge=0.0)
     user_agent: str = Field(default=USER_AGENT)
 

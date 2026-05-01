@@ -386,3 +386,59 @@ async def test_stream_holds_semaphore_for_duration(
         # Re-fill the semaphore for hygiene.
         for _ in range(c._sem._value, c._sem._value):
             pass
+
+
+async def test_stream_releases_sem_during_retry_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirroring request(): retry-backoff sleep must NOT hold the semaphore.
+    Otherwise one rate-limited stream freezes 1/N of the cap for up to 60s."""
+    import claude_migrate.client as cm
+
+    sem_levels: list[int] = []
+
+    async def fake_sleep(t: float) -> None:
+        # Snapshot _sem._value mid-sleep — should equal initial (released).
+        sem_levels.append(c._sem._value)
+
+    monkeypatch.setattr(cm.asyncio, "sleep", fake_sleep)
+    c = _client()
+    initial = c._sem._value
+    c._session = _FakeStreamSession(
+        _FakeStreamResp(429), _FakeStreamResp(200),
+    )
+    async for _ in c.stream("POST", "/api/x"):
+        pass
+    # During the one retry sleep, _sem was fully released.
+    assert sem_levels == [initial], (
+        f"_sem was held during retry sleep (saw level {sem_levels})"
+    )
+
+
+async def test_session_init_is_lock_protected_under_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent first calls to client.session() must NOT both create
+    a fresh AsyncSession (the second would clobber the first, leaking it)."""
+    creation_count = 0
+
+    class _Sentinel:
+        async def close(self) -> None: ...
+
+    def fake_async_session(impersonate: object) -> _Sentinel:
+        nonlocal creation_count
+        creation_count += 1
+        return _Sentinel()
+
+    import claude_migrate.client as cm
+
+    monkeypatch.setattr(cm, "AsyncSession", fake_async_session)
+    c = _client()
+
+    async def acquire_session() -> object:
+        async with c.session() as s:
+            return s
+
+    s1, s2 = await asyncio.gather(acquire_session(), acquire_session())
+    assert s1 is s2, "concurrent first-calls produced two different sessions"
+    assert creation_count == 1, f"AsyncSession instantiated {creation_count} times (expected 1)"

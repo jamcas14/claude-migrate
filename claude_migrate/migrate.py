@@ -154,7 +154,13 @@ async def verify_target_conversations(
     a subsequent `migrate` will re-create them. Unknown rows are NOT
     reconciled — that would erase server-confirmed work on a transient blip.
     """
-    from .errors import EndpointChanged, NetworkError
+    from .errors import (
+        ClientVersionStale,
+        CloudflareChallenge,
+        EndpointChanged,
+        NetworkError,
+        RateLimited,
+    )
 
     confirmed = 0
     missing: list[tuple[str, str]] = []
@@ -172,8 +178,15 @@ async def verify_target_conversations(
                     )
                     confirmed += 1
                 except EndpointChanged:
+                    # 404 is a definitive missing-on-target signal.
                     missing.append((source_uuid, target_uuid))
-                except NetworkError as e:
+                except (
+                    NetworkError, RateLimited, CloudflareChallenge,
+                    ClientVersionStale,
+                ) as e:
+                    # Per-row failure: don't classify as missing (might still
+                    # exist on target — we just couldn't see it). Logged so
+                    # the user can re-run after the transient issue clears.
                     log.warning(
                         "verify_probe_failed",
                         source_uuid=source_uuid, err=str(e),

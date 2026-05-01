@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import keyring
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from keyring.errors import KeyringError, NoKeyringError, PasswordDeleteError
 
@@ -229,9 +230,22 @@ def _index_save(names: set[str]) -> None:
     p = _index_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     body = "\n".join(sorted(names)) + ("\n" if names else "")
-    # Atomic replace, like the secrets file.
     tmp = p.with_name(p.name + f".tmp-{os.getpid()}")
-    tmp.write_text(body, "utf-8")
+    # Atomic replace: write+fsync to a tempfile, then os.replace. Without the
+    # fsync, "atomic" only protects against torn writes from concurrent
+    # processes, not against power-loss leaving an empty file as the index.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
     os.replace(tmp, p)
 
 
@@ -287,19 +301,47 @@ def _get_or_prompt_passphrase(*, prompt: str, confirming: bool = False) -> str:
 
 
 def _fallback_blob_load() -> dict[str, dict[str, str]]:
+    """Decrypt the fallback secrets blob. Wraps every parse/decrypt failure
+    as `AuthInvalid` so callers can `with contextlib.suppress(AuthInvalid):`
+    around it without missing JSONDecodeError, KeyError, base64 decode, or
+    AES-GCM tag-mismatch failures."""
+    global _cached_passphrase
+
     p = _fallback_path()
     if not p.exists():
         return {}
-    raw = json.loads(p.read_text("utf-8"))
-    salt = base64.b64decode(raw["salt"])
-    nonce = base64.b64decode(raw["nonce"])
-    ct = base64.b64decode(raw["ct"])
+    try:
+        raw = json.loads(p.read_text("utf-8"))
+        salt = base64.b64decode(raw["salt"])
+        nonce = base64.b64decode(raw["nonce"])
+        ct = base64.b64decode(raw["ct"])
+    except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
+        raise AuthInvalid(
+            f"Encrypted secrets file at {p} is unreadable ({e}). "
+            "If you don't recognize this file, delete it and re-run "
+            "`claude-migrate add <profile>` to recreate."
+        ) from e
     pp = _get_or_prompt_passphrase(
         prompt="Passphrase for claude-migrate secrets file: "
     )
     key = _derive_key(pp, salt)
-    pt = AESGCM(key).decrypt(nonce, ct, None)
-    parsed: Any = json.loads(pt.decode("utf-8"))
+    try:
+        pt = AESGCM(key).decrypt(nonce, ct, None)
+    except InvalidTag as e:
+        # Wrong passphrase — clear the cache so the user can retry without
+        # corrupting the file on a subsequent save (a wrong cached passphrase
+        # would derive a new key and overwrite the file with un-decryptable
+        # content).
+        _cached_passphrase = None
+        raise AuthInvalid(
+            "Wrong passphrase for the encrypted secrets file."
+        ) from e
+    try:
+        parsed: Any = json.loads(pt.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise AuthInvalid(
+            f"Decrypted secrets blob is malformed ({e})."
+        ) from e
     if not isinstance(parsed, dict):
         return {}
     return parsed

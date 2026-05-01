@@ -54,7 +54,6 @@ Anthropic's `claude.com/import-memory`.
 | `scheduler.py` | Per-OS daily timer install/uninstall (systemd/launchd/Task Scheduler/cron). |
 | `cli.py` | Click commands. Verb-first, positional args. Dry-run default. |
 | `errors.py` | Typed exception hierarchy. Catch specifically; never `except Exception`. |
-| `models.py` | Pydantic v2 with `extra="allow"` everywhere — schema drift is expected. |
 
 ## Rendering mode
 
@@ -74,17 +73,22 @@ defensively in case the API ever populates them.
 
 ## Conventions
 
-- **`mypy --strict`.** No `Any` outside `models.py`'s extra-allow boundary.
+- **`mypy --strict`.** Allow `Any` only in API-boundary parsing (`fetch.py`,
+  `discover.py` shape probing) since claude.ai's payloads have unstable shape.
 - **All I/O is async.** No blocking calls in the hot path.
 - **One thin HTTP layer.** Every request goes through `client.py::request()`.
-- **Pydantic at boundaries.** API → Pydantic → SQLite.
+- **API → SQLite directly.** Validate at usage sites (`isinstance(payload,
+  dict)`, key checks); we don't run Pydantic models since claude.ai's
+  payloads change too often to keep typed shapes in sync.
 - **Errors are typed.** `errors.py` defines them; `cli._run` maps them to
   exit codes with specific user-facing messages.
 - **Logs.** `structlog` with `ConsoleRenderer` to stderr on TTY. Use
   `log.info("event_name", key=value, …)` — events are searchable.
 - **No `await` inside `with transaction(conn): ...`.** SQLite connections
-  don't multiplex transactions per coroutine; if you must await, end the
-  transaction first or open a fresh connection. See `store.transaction()`.
+  don't multiplex transactions per coroutine. If you genuinely need an
+  `await` inside a transactional unit, use `async with async_transaction(
+  conn): ...` instead — it holds a per-connection `asyncio.Lock` so the
+  scheduler can't interleave two BEGIN/COMMIT pairs on one connection.
 
 ## Build / test
 

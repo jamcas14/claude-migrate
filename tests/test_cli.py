@@ -120,6 +120,13 @@ def test_parse_window_garbage_raises_value_error() -> None:
         _parse_window_arg("not-a-date")
 
 
+def test_parse_window_naive_input_assumes_utc() -> None:
+    """Bare-naive input → tz-aware UTC datetime."""
+    dt = _parse_window_arg("2026-04-30T14:37:00")
+    assert dt.tzinfo is UTC
+    assert dt.utcoffset().total_seconds() == 0
+
+
 def test_cleanup_garbage_arg_exits_two() -> None:
     """The CLI command translates parse failures into exit code 2 with a hint."""
     runner = CliRunner()

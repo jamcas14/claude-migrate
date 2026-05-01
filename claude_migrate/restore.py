@@ -12,7 +12,7 @@ import asyncio
 import json
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -125,7 +125,8 @@ async def restore_styles(
                 )
             except RateLimited as e:
                 return WorkerOutcome.failed(f"style: {e}", rate_limited=True)
-            except (EndpointChanged, NetworkError) as e:
+            except (ClientVersionStale, EndpointChanged, NetworkError) as e:
+                # ClientVersionStale = headers stale; per-row failure, run continues.
                 return WorkerOutcome.failed(f"style: {e}")
             new_uuid = created.get("uuid") if isinstance(created, dict) else None
             if not isinstance(new_uuid, str):
@@ -206,7 +207,9 @@ async def restore_projects(
                     return WorkerOutcome.ok(new_uuid)
                 except RateLimited as e:
                     return WorkerOutcome.failed(f"project: {e}", rate_limited=True)
-                except (EndpointChanged, NetworkError, SchemaDrift) as e:
+                except (
+                    ClientVersionStale, EndpointChanged, NetworkError, SchemaDrift,
+                ) as e:
                     return WorkerOutcome.failed(f"project: {e}")
 
             outcome = await migrate_row(
@@ -222,7 +225,19 @@ async def restore_projects(
                 summary.record_failure(source_uuid, outcome.error or "unknown")
 
     if rows:
-        await asyncio.gather(*(one(r) for r in rows))
+        # return_exceptions=True so a session-fatal raise out of one worker
+        # doesn't cancel sibling workers mid-create — without this, a
+        # CloudflareChallenge in worker A would leave worker B's freshly-
+        # POST'd project orphaned with no migration_log entry.
+        results = await asyncio.gather(
+            *(one(r) for r in rows), return_exceptions=True
+        )
+        # Re-raise the first session-fatal we saw, after the gather has
+        # cleaned up. This lets the orchestrator surface the right re-auth
+        # message while still recording any per-row errors that completed.
+        for res in results:
+            if isinstance(res, AuthExpired | CloudflareChallenge | TLSReject):
+                raise res
     return mapping
 
 
@@ -273,6 +288,12 @@ async def find_orphan_conversations(
                 ca_dt = datetime.fromisoformat(ca)
             except ValueError:
                 continue
+            # `created_after`/`created_before` are tz-aware UTC. claude.ai
+            # has shipped both `...Z` (parses to aware) and bare-naive
+            # strings — coerce naive to UTC so the comparison can't raise
+            # `TypeError: can't compare offset-naive and offset-aware`.
+            if ca_dt.tzinfo is None:
+                ca_dt = ca_dt.replace(tzinfo=UTC)
             if created_after <= ca_dt <= created_before:
                 candidates.append(c)
         last = page[-1]
@@ -281,6 +302,8 @@ async def find_orphan_conversations(
         # Stop paginating once we've gone past the window's lower bound.
         try:
             oldest_dt = datetime.fromisoformat(page_oldest)
+            if oldest_dt.tzinfo is None:
+                oldest_dt = oldest_dt.replace(tzinfo=UTC)
             if oldest_dt < created_after:
                 break
         except ValueError:
@@ -296,7 +319,11 @@ async def find_orphan_conversations(
         try:
             full = await client.get_json(
                 f"/api/organizations/{target_org}/chat_conversations/{cu}",
-                params={"tree": "True", "rendering_mode": "raw"},
+                # `messages` is the canonical mode (CLAUDE.md). We only need
+                # `len(chat_messages) == 0` so the mode choice is irrelevant
+                # for correctness, but staying on `messages` means a future
+                # API drop of `raw` doesn't break orphan cleanup.
+                params={"tree": "True", "rendering_mode": "messages"},
                 timeout=15.0,
             )
         except (EndpointChanged, NetworkError) as e:

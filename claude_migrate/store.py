@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import gzip
 import hashlib
@@ -9,8 +10,8 @@ import json
 import re
 import sqlite3
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -150,17 +151,31 @@ def open_db(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+# Per-connection asyncio Lock keyed by id(conn). sqlite3.Connection lacks
+# `__weakref__` so a WeakKeyDictionary won't work; the small per-process leak
+# (one Lock per connection ever opened) is acceptable for a CLI tool.
+_conn_locks: dict[int, asyncio.Lock] = {}
+
+
+def _conn_lock(conn: sqlite3.Connection) -> asyncio.Lock:
+    """Lazy per-connection asyncio.Lock for `async_transaction`."""
+    key = id(conn)
+    lock = _conn_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _conn_locks[key] = lock
+    return lock
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """BEGIN/COMMIT/ROLLBACK helper for autocommit-mode connections.
+    """Synchronous BEGIN/COMMIT/ROLLBACK helper for autocommit-mode connections.
 
-    Concurrency invariant: do NOT `await` between BEGIN and COMMIT. SQLite
-    Connection objects don't multiplex transactions per coroutine — if two
-    coroutines on the same connection issue overlapping BEGIN/COMMIT pairs,
-    they corrupt each other's transactions. Every call site today keeps its
-    transaction body purely synchronous (sqlite calls are not awaitable
-    anyway), so the invariant holds. Adding an `await` inside a `with
-    transaction(conn): ...` block re-introduces the hazard.
+    Concurrency invariant: this synchronous variant must NOT have an `await`
+    in its body — sqlite3.Connection serializes transactions per-connection,
+    not per-coroutine. For coroutines that need to do async work as part of
+    a transactional unit, use `async_transaction` which adds an asyncio.Lock
+    around the whole block.
     """
     conn.execute("BEGIN")
     try:
@@ -170,6 +185,27 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
     else:
         conn.execute("COMMIT")
+
+
+@asynccontextmanager
+async def async_transaction(conn: sqlite3.Connection) -> AsyncIterator[sqlite3.Connection]:
+    """Async version of `transaction()` — holds a per-connection asyncio.Lock
+    around the whole block. Use this when concurrent coroutines may both want
+    to issue BEGIN/COMMIT against the same connection.
+
+    For purely-synchronous transaction bodies (no `await` between BEGIN and
+    COMMIT), the synchronous `transaction()` is sufficient. Reach for this
+    helper only when an `await` inside is unavoidable — see CLAUDE.md.
+    """
+    async with _conn_lock(conn):
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
 
 
 def write_raw(slug: str, payload: Any) -> Path:

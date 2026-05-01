@@ -10,6 +10,7 @@ names are arbitrary strings (`source`, `target`, `work`, `personal-old`, etc.)
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sys
 from collections.abc import Coroutine
@@ -323,7 +324,20 @@ def rename(old_name: str, new_name: str) -> None:
         sys.exit(2)
     from .auth import store_profile  # local to keep top-level imports tight
     store_profile(new_name, profile)
-    remove_profile(old_name)
+    try:
+        remove_profile(old_name)
+    except Exception as e:
+        # Roll back the new write so we don't leave both names live with
+        # identical credentials. The user can retry; a re-run of `rename`
+        # will cleanly find only the old name.
+        with contextlib.suppress(Exception):
+            remove_profile(new_name)
+        click.echo(
+            f"Could not remove old profile {old_name!r}: {e}. "
+            f"Rolled back the rename. No credentials were lost.",
+            err=True,
+        )
+        sys.exit(1)
     click.echo(f"Renamed {old_name!r} → {new_name!r}.")
 
 
@@ -803,14 +817,28 @@ def cleanup(
         return
 
     async def delete() -> None:
+        # Pace deletes: a tight DELETE loop hits the same rate-limit
+        # window /completion does. 0.5s between calls + a Pacer that
+        # respects 429 cooldowns lets cleanup of large orphan sets finish
+        # without abandoning halfway through.
+        from .runner import Pacer, WorkerOutcome
+        pacer = Pacer(base_sleep_sec=0.5, rate_limit_sleep_sec=60.0)
         async with open_session(target) as session:
             deleted = 0
             for c in orphans:
                 cu = c.get("uuid")
                 if not isinstance(cu, str):
                     continue
-                if await delete_conversation(session.client, session.org_uuid, cu):
+                await pacer.before()
+                ok = await delete_conversation(session.client, session.org_uuid, cu)
+                if ok:
                     deleted += 1
+                    await pacer.after(WorkerOutcome.ok(cu))
+                else:
+                    # delete_conversation only fails for EndpointChanged or
+                    # NetworkError — both already logged. Treat as ordinary
+                    # outcome (no rate-limited flag without explicit signal).
+                    await pacer.after(WorkerOutcome.failed("delete failed"))
             click.echo(f"  deleted {deleted}/{len(orphans)} orphans")
 
     _run(delete())

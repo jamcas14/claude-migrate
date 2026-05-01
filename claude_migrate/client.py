@@ -58,11 +58,17 @@ class ClaudeClient:
         # from settings so users can tune it via env var or config.toml.
         self._sem = asyncio.Semaphore(concurrency or settings.concurrency)
         self._session: Any = None
+        # Init lock — without this, two concurrent first calls to session()
+        # both see _session is None, both create AsyncSession, the second
+        # clobbers the first and the first's connection pool is leaked.
+        self._init_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[Any]:
         if self._session is None:
-            self._session = AsyncSession(impersonate=cast(Any, IMPERSONATE))
+            async with self._init_lock:
+                if self._session is None:  # double-checked under lock
+                    self._session = AsyncSession(impersonate=cast(Any, IMPERSONATE))
         yield self._session
 
     async def close(self) -> None:
@@ -239,86 +245,87 @@ class ClaudeClient:
         merged = dict(headers or {})
         merged.setdefault("Accept", "text/event-stream")
         attempt = 0
-        async with self._sem:
-            while True:
-                attempt += 1
-                async with self.session() as sess:
-                    try:
-                        stream_ctx = sess.stream(
-                            cast(Any, method),
-                            url,
-                            json=json_body,
-                            headers=self._headers(merged),
-                            timeout=timeout,
+        while True:
+            attempt += 1
+            retry_after: float | None = None
+            # Acquire _sem only for this attempt. On 429/5xx retry, we drop
+            # the sem before sleeping — otherwise one rate-limited stream
+            # would freeze 1/N of the concurrency budget for up to 60s.
+            async with self._sem, self.session() as sess:
+                try:
+                    stream_ctx = sess.stream(
+                        cast(Any, method),
+                        url,
+                        json=json_body,
+                        headers=self._headers(merged),
+                        timeout=timeout,
+                    )
+                except RequestsError as e:
+                    raise NetworkError(f"stream {url}: {e}") from e
+                async with stream_ctx as resp:
+                    status = resp.status_code
+                    if status == 401:
+                        raise AuthExpired(f"{path} 401")
+                    if status == 403:
+                        preview = await _read_body_preview(resp, max_bytes=400)
+                        if (
+                            "Just a moment" in preview
+                            or "cf-mitigated" in preview
+                            or "challenge-platform" in preview
+                        ):
+                            raise CloudflareChallenge(f"{path} 403 (Cloudflare)")
+                        raise TLSReject(f"{path} 403 (TLS fingerprint)")
+                    if status == 429:
+                        if attempt > MAX_RETRIES:
+                            raise RateLimited(
+                                f"stream {path} 429 after {MAX_RETRIES} retries"
+                            )
+                        base = BACKOFF_SCHEDULE[
+                            min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)
+                        ]
+                        retry_after = base + random.uniform(0, 0.5)
+                        log.warning(
+                            "stream_rate_limited", path=path,
+                            retry_in_sec=retry_after,
                         )
-                    except RequestsError as e:
-                        raise NetworkError(f"stream {url}: {e}") from e
-                    async with stream_ctx as resp:
-                        status = resp.status_code
-                        if status == 401:
-                            raise AuthExpired(f"{path} 401")
-                        if status == 403:
-                            # Distinguish CF interstitial from TLS reject by
-                            # peeking at the body — same logic as request().
-                            preview = await _read_body_preview(resp, max_bytes=400)
-                            if (
-                                "Just a moment" in preview
-                                or "cf-mitigated" in preview
-                                or "challenge-platform" in preview
-                            ):
-                                raise CloudflareChallenge(f"{path} 403 (Cloudflare)")
-                            raise TLSReject(f"{path} 403 (TLS fingerprint)")
-                        retry_after: float | None = None
-                        if status == 429:
-                            if attempt > MAX_RETRIES:
-                                raise RateLimited(
-                                    f"stream {path} 429 after {MAX_RETRIES} retries"
-                                )
-                            base = BACKOFF_SCHEDULE[
-                                min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)
-                            ]
-                            retry_after = base + random.uniform(0, 0.5)
-                            log.warning(
-                                "stream_rate_limited", path=path,
-                                retry_in_sec=retry_after,
-                            )
-                        elif 500 <= status < 600:
-                            if attempt > MAX_RETRIES:
-                                raise NetworkError(
-                                    f"stream {path} {status} after retries"
-                                )
-                            base = BACKOFF_SCHEDULE[
-                                min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)
-                            ]
-                            retry_after = base + random.uniform(0, 0.5)
-                            log.warning(
-                                "stream_5xx_retry", path=path, status=status,
-                                retry_in_sec=retry_after,
-                            )
-                        elif not (200 <= status < 300):
-                            preview = await _read_body_preview(resp, max_bytes=400)
+                    elif 500 <= status < 600:
+                        if attempt > MAX_RETRIES:
                             raise NetworkError(
-                                f"stream {path} status {status}: {preview[:400]}"
+                                f"stream {path} {status} after retries"
                             )
-                        else:
-                            # Happy path: yield each line. From here on, we're
-                            # past the handshake — no retry possible.
-                            try:
-                                async for line in resp.aiter_lines():
-                                    if not line:
-                                        continue
-                                    if isinstance(line, bytes):
-                                        line = line.decode("utf-8", errors="replace")
-                                    yield line
-                            except RequestsError as e:
-                                raise NetworkError(f"stream {url}: {e}") from e
-                            return  # stream completed
-                # Retry path: sleep happens after the response context closed
-                # so the connection releases first, then we re-enter the loop.
-                # `retry_after` is always set here — the non-retry branches
-                # above either `return` (happy path) or `raise`.
-                assert retry_after is not None  # for mypy
-                await asyncio.sleep(retry_after)
+                        base = BACKOFF_SCHEDULE[
+                            min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)
+                        ]
+                        retry_after = base + random.uniform(0, 0.5)
+                        log.warning(
+                            "stream_5xx_retry", path=path, status=status,
+                            retry_in_sec=retry_after,
+                        )
+                    elif not (200 <= status < 300):
+                        preview = await _read_body_preview(resp, max_bytes=400)
+                        raise NetworkError(
+                            f"stream {path} status {status}: {preview[:400]}"
+                        )
+                    else:
+                        # Happy path: yield each line. We yield while still
+                        # inside _sem and the response context — that's
+                        # intentional, the cap applies to the full lifetime
+                        # of an in-flight stream.
+                        try:
+                            async for line in resp.aiter_lines():
+                                if not line:
+                                    continue
+                                if isinstance(line, bytes):
+                                    line = line.decode("utf-8", errors="replace")
+                                yield line
+                        except RequestsError as e:
+                            raise NetworkError(f"stream {url}: {e}") from e
+                        return  # stream completed
+            # Both contexts have exited; _sem and the session ctx are released.
+            # `retry_after` is set iff we took a retry branch above; the other
+            # branches either returned (happy) or raised.
+            assert retry_after is not None
+            await asyncio.sleep(retry_after)
 
 
 async def _read_body_preview(resp: Any, *, max_bytes: int = 400) -> str:
