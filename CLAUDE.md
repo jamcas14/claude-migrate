@@ -86,9 +86,9 @@ defensively in case the API ever populates them.
   `log.info("event_name", key=value, …)` — events are searchable.
 - **No `await` inside `with transaction(conn): ...`.** SQLite connections
   don't multiplex transactions per coroutine. If you genuinely need an
-  `await` inside a transactional unit, use `async with async_transaction(
-  conn): ...` instead — it holds a per-connection `asyncio.Lock` so the
-  scheduler can't interleave two BEGIN/COMMIT pairs on one connection.
+  `await` inside a transactional unit, wrap the connection in an
+  `asyncio.Lock` at the call site — `transaction()` itself stays
+  synchronous-body-only.
 
 ## Build / test
 

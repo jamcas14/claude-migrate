@@ -26,6 +26,39 @@ def _client() -> ClaudeClient:
     )
 
 
+# ---------------------------------------------------------------------------
+# Credentials repr — must NOT leak secrets.
+# ---------------------------------------------------------------------------
+
+
+def test_credentials_repr_redacts_session_key_and_cf_clearance() -> None:
+    """An accidental log.info(creds=...) would otherwise leak the cookies."""
+    creds = Credentials(
+        session_key="sk-ant-sid01-VERY-SECRET-DO-NOT-LOG",
+        cf_clearance="cf-clearance-also-secret-12345",
+        email="user@example.com",
+    )
+    text = repr(creds)
+    # Length fingerprints are OK; raw values must not appear.
+    assert "VERY-SECRET" not in text
+    assert "cf-clearance-also-secret" not in text
+    # Sanity: the redacted shape is debuggable.
+    assert "session_key=<" in text
+    assert "chars>" in text
+    assert "cf_clearance=<" in text
+    # Non-secret fields still render.
+    assert "user@example.com" in text
+
+
+def test_credentials_str_also_redacted() -> None:
+    """str() falls through to __repr__; same protection."""
+    creds = Credentials(
+        session_key="sk-ant-sid01-LEAKY",
+        cf_clearance="cf-LEAKY",
+    )
+    assert "LEAKY" not in str(creds)
+
+
 def test_cookie_header_basic() -> None:
     c = _client()
     h = c._cookie_header()

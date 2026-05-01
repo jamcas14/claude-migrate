@@ -26,7 +26,6 @@ from .errors import (
     EndpointChanged,
     NetworkError,
     RateLimited,
-    RestoreConflict,
     SchemaDrift,
     TLSReject,
 )
@@ -81,8 +80,11 @@ async def restore_profile_prefs(
         return False
     try:
         await client.put_json("/api/account", body=settable)
-    except (AuthExpired, CloudflareChallenge):
+    except (AuthExpired, CloudflareChallenge, TLSReject):
         # Session-fatal: re-raise so the orchestrator halts and surfaces re-auth.
+        # `TLSReject` belongs here too — every subsequent call would fail the
+        # same way, so logging "best-effort, continuing" would just delay the
+        # inevitable abort.
         raise
     except ClaudeMigrateError as e:
         log.warning(
@@ -297,9 +299,12 @@ async def find_orphan_conversations(
             if created_after <= ca_dt <= created_before:
                 candidates.append(c)
         last = page[-1]
-        if not isinstance(last, dict) or "uuid" not in last or len(page) < 100:
+        if not isinstance(last, dict) or "uuid" not in last:
             break
-        # Stop paginating once we've gone past the window's lower bound.
+        # Stop paginating once we've gone past the window's lower bound. Note:
+        # short page is NOT a terminator — claude.ai sometimes returns short
+        # windows mid-stream, and breaking early there would silently drop
+        # later orphans (mirrors fetch_conversation_list).
         try:
             oldest_dt = datetime.fromisoformat(page_oldest)
             if oldest_dt.tzinfo is None:
@@ -308,7 +313,12 @@ async def find_orphan_conversations(
                 break
         except ValueError:
             pass
-        cursor = last["uuid"]
+        next_cursor = last["uuid"]
+        if next_cursor == cursor:
+            # Cursor stuck; bail rather than spin forever.
+            log.warning("orphan_list_cursor_stuck", cursor=cursor)
+            break
+        cursor = next_cursor
 
     # Per-candidate verify: fetch the tree and only keep zero-message ones.
     confirmed: list[dict[str, Any]] = []
@@ -361,6 +371,10 @@ async def reorder_conversations(
     touched = 0
     missing = 0
     errors: list[tuple[str, str]] = []
+    # Pace reorder PUTs the same way conversation restore does — without it,
+    # a 429 mid-reorder propagates and aborts the whole loop, leaving the
+    # target Recents partially-fixed.
+    pacer = Pacer(base_sleep_sec=0.5, rate_limit_sleep_sec=60.0)
     for row in rows:
         source_uuid = row["uuid"]
         target_uuid = state.already_migrated(source_uuid)
@@ -371,6 +385,7 @@ async def reorder_conversations(
             touched += 1
             continue
         try:
+            await pacer.before()
             current = await client.get_json(
                 f"/api/organizations/{target_org}/chat_conversations/{target_uuid}",
                 timeout=15.0,
@@ -387,9 +402,13 @@ async def reorder_conversations(
                 timeout=15.0,
             )
             touched += 1
-            await asyncio.sleep(0.5)
-        except (EndpointChanged, NetworkError) as e:
+            await pacer.after(WorkerOutcome.ok(target_uuid))
+        except RateLimited as e:
             errors.append((source_uuid, f"reorder: {e}"))
+            await pacer.after(WorkerOutcome.failed(str(e), rate_limited=True))
+        except (EndpointChanged, NetworkError, ClientVersionStale) as e:
+            errors.append((source_uuid, f"reorder: {e}"))
+            await pacer.after(WorkerOutcome.failed(str(e)))
     return touched, missing, errors
 
 
@@ -470,7 +489,7 @@ async def restore_conversation(
         # orchestrator stops and surfaces a re-auth instruction.
         await _cleanup_partial(client, target_org, new_uuid)
         raise
-    except (ClientVersionStale, EndpointChanged, SchemaDrift, RestoreConflict) as e:
+    except (ClientVersionStale, EndpointChanged, SchemaDrift) as e:
         # ClientVersionStale: per-row failure (the run can continue; only this
         # request's body shape was rejected). User can refresh headers and retry.
         await _cleanup_partial(client, target_org, new_uuid)

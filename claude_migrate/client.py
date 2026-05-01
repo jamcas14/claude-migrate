@@ -7,7 +7,7 @@ import json
 import random
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import structlog
@@ -34,12 +34,25 @@ MAX_RETRIES = 3
 
 @dataclass(frozen=True)
 class Credentials:
-    """Cookies + the discovered org context, materialized just before requests."""
+    """Cookies + the discovered org context, materialized just before requests.
 
-    session_key: str
-    cf_clearance: str
+    `__repr__` redacts the secret fields so an accidental `log.info(creds=...)`
+    or exception that includes the dataclass can't leak credentials to stderr,
+    log files, or crash reports.
+    """
+
+    session_key: str = field(repr=False)
+    cf_clearance: str = field(repr=False)
     org_uuid: str | None = None
     email: str | None = None
+
+    def __repr__(self) -> str:
+        # Show fingerprints, not full values, so debugging is still possible.
+        return (
+            f"Credentials(session_key=<{len(self.session_key)} chars>, "
+            f"cf_clearance=<{len(self.cf_clearance)} chars>, "
+            f"org_uuid={self.org_uuid!r}, email={self.email!r})"
+        )
 
 
 class ClaudeClient:
@@ -275,6 +288,24 @@ class ClaudeClient:
                         ):
                             raise CloudflareChallenge(f"{path} 403 (Cloudflare)")
                         raise TLSReject(f"{path} 403 (TLS fingerprint)")
+                    if status == 404:
+                        raise EndpointChanged(f"stream {path} returned 404")
+                    if status in (400, 422):
+                        # Mirror request()'s split: typed ClientVersionStale
+                        # for fingerprint-stale rejections so the user gets
+                        # the headers-help recovery message, not an opaque
+                        # NetworkError.
+                        preview = await _read_body_preview(resp, max_bytes=4096)
+                        api_msg = _extract_api_error(preview.encode("utf-8"))
+                        if api_msg:
+                            raise NetworkError(
+                                f"stream {path} → {status}: {api_msg}"
+                            )
+                        raise ClientVersionStale(
+                            f"stream {path} returned {status}. The most likely "
+                            "cause is a stale or missing `anthropic-client-version` "
+                            "/ `anthropic-client-sha` header."
+                        )
                     if status == 429:
                         if attempt > MAX_RETRIES:
                             raise RateLimited(

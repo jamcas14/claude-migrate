@@ -75,12 +75,6 @@ class SchemaDrift(ClaudeMigrateError):
     code = "schema_drift"
 
 
-class RestoreConflict(ClaudeMigrateError):
-    """Target already has data that would clash with restore."""
-
-    code = "restore_conflict"
-
-
 class KeyringUnavailable(ClaudeMigrateError):
     """OS secret store is not usable; fallback path needed."""
 

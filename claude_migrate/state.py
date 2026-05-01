@@ -64,12 +64,16 @@ class RestoreState:
             )
 
     def drop(self, source_uuid: str) -> None:
-        """Delete a row so the next restore re-attempts the object."""
-        with self.conn:
-            self.conn.execute(
-                "DELETE FROM migration_log WHERE source_uuid=? AND target_profile=?",
-                (source_uuid, self.target_profile),
-            )
+        """Delete a row so the next restore re-attempts the object.
+
+        Single statement, autocommit mode → no surrounding transaction needed.
+        (`with self.conn:` would be a no-op here: sqlite3.Connection only
+        wraps BEGIN/COMMIT when `isolation_level is not None`.)
+        """
+        self.conn.execute(
+            "DELETE FROM migration_log WHERE source_uuid=? AND target_profile=?",
+            (source_uuid, self.target_profile),
+        )
 
     # -- per-row reads ---------------------------------------------------
 

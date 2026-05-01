@@ -50,21 +50,6 @@ async def fetch_account(client: ClaudeClient, conn: sqlite3.Connection, org_uuid
         mark_dumped(conn, "account", org_uuid, updated_at=None, payload=payload)
 
 
-async def fetch_orgs(client: ClaudeClient, conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    try:
-        payload = await client.get_json("/api/organizations")
-    except EndpointChanged:
-        return []
-    if not isinstance(payload, list):
-        raise SchemaDrift("/api/organizations not a list")
-    write_raw("organizations", payload)
-    with transaction(conn):
-        for org in payload:
-            if isinstance(org, dict) and "uuid" in org:
-                upsert_org(conn, org)
-    return [o for o in payload if isinstance(o, dict)]
-
-
 async def fetch_styles(client: ClaudeClient, conn: sqlite3.Connection, org_uuid: str) -> None:
     try:
         styles = await client.get_json(f"/api/organizations/{org_uuid}/custom_styles")
