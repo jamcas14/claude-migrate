@@ -113,11 +113,13 @@ class RestoreState:
         return int(row[0])
 
     def recent_failures(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        # rowid DESC tiebreaker: Windows clock resolution can stamp two writes
+        # with identical migrated_at, leaving the order undefined otherwise.
         rows = self.conn.execute(
             "SELECT source_uuid, object_type, error, migrated_at "
             "FROM migration_log "
             "WHERE target_profile=? AND status='error' "
-            "ORDER BY migrated_at DESC LIMIT ?",
+            "ORDER BY migrated_at DESC, rowid DESC LIMIT ?",
             (self.target_profile, limit),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -125,7 +127,7 @@ class RestoreState:
     def last_activity(self) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT migrated_at, status FROM migration_log "
-            "WHERE target_profile=? ORDER BY migrated_at DESC LIMIT 1",
+            "WHERE target_profile=? ORDER BY migrated_at DESC, rowid DESC LIMIT 1",
             (self.target_profile,),
         ).fetchone()
         return dict(row) if row else None
