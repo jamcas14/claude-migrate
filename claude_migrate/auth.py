@@ -1,7 +1,7 @@
 """Cookie paste flow, normalization, validation, probe, secure storage.
 
-Section 7 of CLAUDE.md is the authoritative spec. Every error message here is
-intentionally specific so users can self-recover without external help.
+Every error message here is intentionally specific so users can self-recover
+without external help.
 """
 
 from __future__ import annotations

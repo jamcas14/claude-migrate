@@ -152,6 +152,16 @@ def open_db(path: Path | None = None) -> sqlite3.Connection:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """BEGIN/COMMIT/ROLLBACK helper for autocommit-mode connections.
+
+    Concurrency invariant: do NOT `await` between BEGIN and COMMIT. SQLite
+    Connection objects don't multiplex transactions per coroutine — if two
+    coroutines on the same connection issue overlapping BEGIN/COMMIT pairs,
+    they corrupt each other's transactions. Every call site today keeps its
+    transaction body purely synchronous (sqlite calls are not awaitable
+    anyway), so the invariant holds. Adding an `await` inside a `with
+    transaction(conn): ...` block re-introduces the hazard.
+    """
     conn.execute("BEGIN")
     try:
         yield conn

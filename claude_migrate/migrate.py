@@ -1,4 +1,4 @@
-"""Top-level migration orchestrator. Wires together restore.py per Section 11."""
+"""Top-level migration orchestrator: backup → plan → restore → verify."""
 
 from __future__ import annotations
 
@@ -48,7 +48,9 @@ async def run_restore(
                 return summary
 
             state = RestoreState(conn, target_profile)
-            # Order of operations per Section 11.
+            # Order of operations: prefs first (cosmetic; cheapest to retry),
+            # then styles → projects → conversations so each phase can use
+            # the project_map from the previous one.
             if do_prefs:
                 summary.profile_prefs = await restore_profile_prefs(
                     session.client, conn, dry_run=dry_run
@@ -120,7 +122,15 @@ async def dry_run_plan(*, target_profile: str) -> dict[str, int]:
         conn.close()
 
 
+_COUNTABLE_TABLES = frozenset({"conversation", "project", "custom_style"})
+
+
 def _table_count(conn: sqlite3.Connection, table: str) -> int:
+    if table not in _COUNTABLE_TABLES:
+        raise ValueError(
+            f"_table_count: refusing unknown table {table!r}; "
+            f"allowed: {sorted(_COUNTABLE_TABLES)}"
+        )
     row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
     return int(row[0])
 
@@ -134,7 +144,7 @@ async def verify_target_conversations(
     target to confirm it still exists. Returns counts + missing UUIDs.
 
     If `reconcile=True`, drops migration_log rows for missing target convs so
-    a subsequent restore --execute will re-create them.
+    a subsequent `migrate` will re-create them.
     """
     from .errors import EndpointChanged, NetworkError
 

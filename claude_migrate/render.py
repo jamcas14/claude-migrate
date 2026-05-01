@@ -1,4 +1,4 @@
-"""Transcript renderer: stored conversation → XML user-message body per Section 10.
+"""Transcript renderer: stored conversation → XML user-message body.
 
 Picks one of three payload variants based on token estimate. The `send_payload`
 function in `transport.py` knows how to put each variant on the wire — that
@@ -207,7 +207,8 @@ def _render_message_body(msg: dict[str, Any]) -> str:
 def _flatten_branch(messages: list[dict[str, Any]], leaf_uuid: str | None) -> list[dict[str, Any]]:
     """Walk parent_message_uuid chain backward from leaf, then reverse.
 
-    Section 8: if leaf is missing, fall back to the deepest path through the tree.
+    If `leaf_uuid` is missing or unknown, fall back to the deepest path through
+    the tree — captures the longest single conversational branch.
     """
     by_uuid = {m["uuid"]: m for m in messages if isinstance(m, dict) and "uuid" in m}
     if leaf_uuid and leaf_uuid in by_uuid:
@@ -280,7 +281,7 @@ FOOTER = (
 
 
 def render_transcript(conn: sqlite3.Connection, conv_uuid: str) -> str:
-    """Build the XML transcript per Section 10 from stored conversation+messages."""
+    """Build the XML transcript from stored conversation + messages."""
     crow = conn.execute(
         "SELECT raw_path, title, model, created_at, updated_at, project_uuid "
         "FROM conversation WHERE uuid=?",

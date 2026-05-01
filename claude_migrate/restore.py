@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -49,16 +49,10 @@ class RestoreSummary:
     conversations_total: int = 0
     conversations_migrated: int = 0
     skipped: int = 0
-    failed: list[tuple[str, str]] | None = None
+    failed: list[tuple[str, str]] = field(default_factory=list)
     dry_run: bool = False
 
-    def __post_init__(self) -> None:
-        if self.failed is None:
-            self.failed = []
-
-    def _record(self, source_uuid: str, label: str) -> None:
-        if self.failed is None:
-            self.failed = []
+    def record_failure(self, source_uuid: str, label: str) -> None:
         self.failed.append((source_uuid, label))
 
 
@@ -142,7 +136,7 @@ async def restore_styles(
         elif outcome.target_uuid:
             summary.styles_migrated += 1
         else:
-            summary._record(source_uuid, outcome.error or "unknown")
+            summary.record_failure(source_uuid, outcome.error or "unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +213,7 @@ async def restore_projects(
                 mapping[source_uuid] = outcome.target_uuid
                 summary.projects_migrated += 1
             else:
-                summary._record(source_uuid, outcome.error or "unknown")
+                summary.record_failure(source_uuid, outcome.error or "unknown")
 
     if rows:
         await asyncio.gather(*(one(r) for r in rows))
@@ -270,7 +264,7 @@ async def find_orphan_conversations(
             if require_empty_name and c.get("name"):
                 continue
             try:
-                ca_dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+                ca_dt = datetime.fromisoformat(ca)
             except ValueError:
                 continue
             if created_after <= ca_dt <= created_before:
@@ -280,7 +274,7 @@ async def find_orphan_conversations(
             break
         # Stop paginating once we've gone past the window's lower bound.
         try:
-            oldest_dt = datetime.fromisoformat(page_oldest.replace("Z", "+00:00"))
+            oldest_dt = datetime.fromisoformat(page_oldest)
             if oldest_dt < created_after:
                 break
         except ValueError:
@@ -390,7 +384,7 @@ def _date_prefix(iso: str | None) -> str:
     if not iso:
         return ""
     try:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+        return datetime.fromisoformat(iso).strftime("%Y-%m-%d")
     except ValueError:
         return ""
 
@@ -475,19 +469,19 @@ async def restore_all_conversations(
 ) -> None:
     """Migrate every conversation in the local archive against `state`'s profile.
 
-    `concurrency=1` (default) preserves the brief's strictly-serial ordering
-    so target Recents matches the source's last-modified order out of the box.
-    `concurrency>1` runs N workers behind a Semaphore — drops wall-clock by
-    ~Nx at the cost of non-deterministic Recents ordering (run
-    `claude-migrate reorder` afterwards to fix). The shared `Pacer` serializes
-    workers during a 429 cooldown to prevent thundering-herd back at the API.
+    `concurrency=1` (default) keeps strictly-serial ordering so target Recents
+    matches the source's last-modified order out of the box. `concurrency>1`
+    runs N workers behind a Semaphore — drops wall-clock by ~Nx at the cost of
+    non-deterministic Recents ordering (run `claude-migrate reorder` afterwards
+    to fix). The shared `Pacer` serializes workers during a 429 cooldown so
+    they don't all hammer back at the API at once.
     """
     from .config import RESTORE_CHAT_RATE_LIMIT_SLEEP_SEC
 
     # Sort by source `updated_at ASC` so that the most-recently-modified source
     # chat is migrated last, ending up at the top of target Recents (which
     # sorts by updated_at desc). Falls back to created_at when updated_at is
-    # NULL — matches the brief's intent for chats with no modification history.
+    # NULL — chats with no modification history get placed by their create-time.
     #
     # Within projects: order by the source project's own created_at ASC so
     # multi-project sources keep chronological project ordering instead of
@@ -568,7 +562,7 @@ async def restore_all_conversations(
             )
             await pacer.after(outcome)  # base inter-call sleep
         else:
-            summary._record(source_uuid, outcome.error or "unknown")
+            summary.record_failure(source_uuid, outcome.error or "unknown")
             log.warning(
                 "conv_migrate_fail",
                 progress=f"{idx + 1}/{total}",

@@ -57,9 +57,8 @@ class EndpointChanged(ClaudeMigrateError):
 
 class ClientVersionStale(ClaudeMigrateError):
     """A request returned 400/422 — the most likely cause is a stale or missing
-    `anthropic-client-version` header. Section 7.9 of the build brief calls out
-    400/422 as the canonical signal that this constant needs refreshing.
-    """
+    `anthropic-client-version` / `anthropic-client-sha` header. Refresh via
+    `claude-migrate config edit`."""
 
     code = "client_version_stale"
 

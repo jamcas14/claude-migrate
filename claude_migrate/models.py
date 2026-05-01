@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 ALLOW = ConfigDict(extra="allow", populate_by_name=True)
 
@@ -22,7 +22,7 @@ class Account(BaseModel):
     model_config = ALLOW
 
     uuid: str | None = None
-    email_address: str | None = Field(default=None, alias="email_address")
+    email_address: str | None = None
     full_name: str | None = None
     settings: dict[str, Any] | None = None
 

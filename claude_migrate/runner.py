@@ -107,7 +107,7 @@ class Pacer:
         """Block while a rate-limit pause is active. Cheap when not paused."""
         while True:
             async with self._lock:
-                wait = self._pause_until - asyncio.get_event_loop().time()
+                wait = self._pause_until - asyncio.get_running_loop().time()
             if wait <= 0:
                 return
             log.info("rate_limit_wait", sleep_sec=round(wait, 1))
@@ -124,7 +124,7 @@ class Pacer:
                 cooldown = min(
                     self.rate_limit_sleep_sec * multiplier, self.max_cooldown_sec
                 )
-                pause_until = asyncio.get_event_loop().time() + cooldown
+                pause_until = asyncio.get_running_loop().time() + cooldown
                 if pause_until > self._pause_until:
                     self._pause_until = pause_until
                 log.warning(

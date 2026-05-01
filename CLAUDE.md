@@ -82,6 +82,9 @@ defensively in case the API ever populates them.
   exit codes with specific user-facing messages.
 - **Logs.** `structlog` with `ConsoleRenderer` to stderr on TTY. Use
   `log.info("event_name", key=value, …)` — events are searchable.
+- **No `await` inside `with transaction(conn): ...`.** SQLite connections
+  don't multiplex transactions per coroutine; if you must await, end the
+  transaction first or open a fresh connection. See `store.transaction()`.
 
 ## Build / test
 
@@ -92,8 +95,8 @@ uv run mypy claude_migrate
 uv run ruff check
 ```
 
-Tests live in `tests/`. The 17-row auth-paste verification matrix
-(Section 7 of the original brief) is encoded in `test_auth.py`. The pacer's
-cooldown behaviour and parallel-safety properties live in `test_runner.py`.
-The transcript renderer's edge cases (thinking summaries, tool placeholders,
-citations, files, project context) live in `test_render.py`.
+Tests live in `tests/`. The exhaustive auth-paste verification matrix is in
+`test_auth.py`. The pacer's cooldown behaviour and parallel-safety properties
+live in `test_runner.py`. The transcript renderer's edge cases (thinking
+summaries, tool placeholders, citations, files, project context) live in
+`test_render.py`.

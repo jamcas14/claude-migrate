@@ -1,7 +1,7 @@
 """Prepare paste-ready text for Anthropic's official memory import flow.
 
-Memory cannot be transferred programmatically (Section 4). What this module
-does:
+Memory cannot be transferred programmatically — Anthropic gates it behind the
+official `claude.com/import-memory` flow. What this module does:
   1. Print a canonical extraction prompt the user pastes into the SOURCE
      account to get its memory contents.
   2. Print clear instructions for taking that output to claude.com/import-memory

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, cast
@@ -14,13 +14,7 @@ import structlog
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.errors import RequestsError
 
-from .config import (
-    BASE_URL,
-    CONCURRENCY,
-    IMPERSONATE,
-    INTER_BATCH_SLEEP_SEC,
-    Settings,
-)
+from .config import BASE_URL, IMPERSONATE, Settings
 from .errors import (
     AuthExpired,
     ClientVersionStale,
@@ -33,8 +27,7 @@ from .errors import (
 
 log = structlog.get_logger(__name__)
 
-# 429 backoff schedule per Section 3 constraint #4: 2 → 4 → 8 → 16 → 32 → 60 (cap),
-# max 3 retries.
+# 429 backoff schedule: 2 → 4 → 8 → 16 → 32 → 60s (cap), max 3 retries.
 BACKOFF_SCHEDULE = (2, 4, 8, 16, 32, 60)
 MAX_RETRIES = 3
 
@@ -57,11 +50,13 @@ class ClaudeClient:
         creds: Credentials,
         settings: Settings,
         *,
-        concurrency: int = CONCURRENCY,
+        concurrency: int | None = None,
     ) -> None:
         self.creds = creds
         self.settings = settings
-        self._sem = asyncio.Semaphore(concurrency)
+        # `concurrency` parameter wins if explicitly passed; otherwise read
+        # from settings so users can tune it via env var or config.toml.
+        self._sem = asyncio.Semaphore(concurrency or settings.concurrency)
         self._session: Any = None
 
     @asynccontextmanager
@@ -115,90 +110,97 @@ class ClaudeClient:
         timeout: float = 30.0,
         expect_json: bool = True,
     ) -> Any:
-        """Issue one HTTP call with retry, backoff, and typed-error mapping."""
+        """Issue one HTTP call with retry, backoff, and typed-error mapping.
+
+        The semaphore (`self._sem`) is acquired only for the actual HTTP send,
+        not the retry-backoff sleep. Holding it across `await asyncio.sleep`
+        would let one rate-limited worker freeze every other in-flight request
+        for up to 60s.
+        """
         url = path if path.startswith("http") else f"{self.settings.base_url}{path}"
         attempt = 0
-        async with self._sem:
-            while True:
-                attempt += 1
-                async with self.session() as sess:
-                    try:
-                        resp = await sess.request(
-                            cast(Any, method),
-                            url,
-                            params=cast(Any, params),
-                            json=json_body,
-                            headers=self._headers(headers),
-                            timeout=timeout,
-                        )
-                    except RequestsError as e:
-                        raise NetworkError(f"{method} {url}: {e}") from e
-
-                status = resp.status_code
-                body = resp.content or b""
-                text_preview = body[:4096].decode("utf-8", errors="replace")
-                log.debug(
-                    "http", method=method, path=path, status=status, attempt=attempt
-                )
-
-                if 200 <= status < 300:
-                    if status == 204 or not body:
-                        return None if expect_json else b""
-                    if not expect_json:
-                        return body
-                    try:
-                        return json.loads(body)
-                    except json.JSONDecodeError as e:
-                        if "Just a moment" in text_preview or "cf-mitigated" in text_preview:
-                            raise CloudflareChallenge(
-                                f"Cloudflare interstitial leaked through {status}"
-                            ) from e
-                        raise
-                if status == 401:
-                    raise AuthExpired(f"{method} {path} returned 401")
-                if status == 403:
-                    if (
-                        "Just a moment" in text_preview
-                        or "cf-mitigated" in text_preview
-                        or "challenge-platform" in text_preview
-                    ):
-                        raise CloudflareChallenge(
-                            "Cloudflare challenged the request — refresh cf_clearance"
-                        )
-                    raise TLSReject("403 with no Cloudflare body — TLS fingerprint reject")
-                if status == 404:
-                    raise EndpointChanged(f"{method} {path} returned 404")
-                if status in (400, 422):
-                    # Distinguish API validation errors (JSON body with a message)
-                    # from fingerprint rejections (HTML / generic Cloudflare body).
-                    api_msg = _extract_api_error(body)
-                    if api_msg:
-                        raise NetworkError(
-                            f"{method} {path} → {status}: {api_msg}"
-                        )
-                    raise ClientVersionStale(
-                        f"{method} {path} returned {status}. The most likely cause is a "
-                        "stale or missing `anthropic-client-version` / `anthropic-client-sha` header."
+        while True:
+            attempt += 1
+            # Acquire only for the network roundtrip, then drop before any
+            # backoff sleep. `_sem` caps concurrent connections; nothing more.
+            async with self._sem, self.session() as sess:
+                try:
+                    resp = await sess.request(
+                        cast(Any, method),
+                        url,
+                        params=cast(Any, params),
+                        json=json_body,
+                        headers=self._headers(headers),
+                        timeout=timeout,
                     )
-                if status == 429:
-                    if attempt > MAX_RETRIES:
-                        raise RateLimited(f"429 after {MAX_RETRIES} retries")
-                    base = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
-                    delay = base + random.uniform(0, 0.5)
-                    log.warning("rate_limited", path=path, retry_in_sec=delay)
-                    await asyncio.sleep(delay)
-                    continue
-                if 500 <= status < 600:
-                    if attempt > MAX_RETRIES:
-                        raise NetworkError(f"{method} {path} → {status} after retries")
-                    base = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
-                    delay = base + random.uniform(0, 0.5)
-                    log.warning("server_error_retry",
-                                path=path, status=status, retry_in_sec=delay)
-                    await asyncio.sleep(delay)
-                    continue
-                raise NetworkError(f"unexpected status {status} for {method} {path}: "
-                                   f"{text_preview[:200]}")
+                except RequestsError as e:
+                    raise NetworkError(f"{method} {url}: {e}") from e
+
+            status = resp.status_code
+            body = resp.content or b""
+            text_preview = body[:4096].decode("utf-8", errors="replace")
+            log.debug(
+                "http", method=method, path=path, status=status, attempt=attempt
+            )
+
+            if 200 <= status < 300:
+                if status == 204 or not body:
+                    return None if expect_json else b""
+                if not expect_json:
+                    return body
+                try:
+                    return json.loads(body)
+                except json.JSONDecodeError as e:
+                    if "Just a moment" in text_preview or "cf-mitigated" in text_preview:
+                        raise CloudflareChallenge(
+                            f"Cloudflare interstitial leaked through {status}"
+                        ) from e
+                    raise
+            if status == 401:
+                raise AuthExpired(f"{method} {path} returned 401")
+            if status == 403:
+                if (
+                    "Just a moment" in text_preview
+                    or "cf-mitigated" in text_preview
+                    or "challenge-platform" in text_preview
+                ):
+                    raise CloudflareChallenge(
+                        "Cloudflare challenged the request — refresh cf_clearance"
+                    )
+                raise TLSReject("403 with no Cloudflare body — TLS fingerprint reject")
+            if status == 404:
+                raise EndpointChanged(f"{method} {path} returned 404")
+            if status in (400, 422):
+                # Distinguish API validation errors (JSON body with a message)
+                # from fingerprint rejections (HTML / generic Cloudflare body).
+                api_msg = _extract_api_error(body)
+                if api_msg:
+                    raise NetworkError(
+                        f"{method} {path} → {status}: {api_msg}"
+                    )
+                raise ClientVersionStale(
+                    f"{method} {path} returned {status}. The most likely cause is a "
+                    "stale or missing `anthropic-client-version` / `anthropic-client-sha` header."
+                )
+            if status == 429:
+                if attempt > MAX_RETRIES:
+                    raise RateLimited(f"429 after {MAX_RETRIES} retries")
+                base = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
+                delay = base + random.uniform(0, 0.5)
+                log.warning("rate_limited", path=path, retry_in_sec=delay)
+                await asyncio.sleep(delay)  # outside _sem — see docstring
+                continue
+            if 500 <= status < 600:
+                if attempt > MAX_RETRIES:
+                    raise NetworkError(f"{method} {path} → {status} after retries")
+                base = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
+                delay = base + random.uniform(0, 0.5)
+                log.warning("server_error_retry",
+                            path=path, status=status, retry_in_sec=delay)
+                await asyncio.sleep(delay)  # outside _sem
+                continue
+            raise NetworkError(f"unexpected status {status} for {method} {path}: "
+                               f"{text_preview[:200]}")
 
     async def get_json(self, path: str, **kw: Any) -> Any:
         return await self.request("GET", path, **kw)
@@ -289,13 +291,3 @@ def _extract_api_error(body: bytes) -> str | None:
     if isinstance(detail, str):
         return detail
     return None
-
-
-async def gentle_iter(items: Iterable[Any], *, sleep: float = INTER_BATCH_SLEEP_SEC) -> AsyncIterator[Any]:
-    """Yield items with mandatory inter-batch sleep per Section 3 #4."""
-    first = True
-    for item in items:
-        if not first:
-            await asyncio.sleep(sleep)
-        first = False
-        yield item

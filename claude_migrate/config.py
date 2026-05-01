@@ -32,14 +32,14 @@ IMPERSONATE = "chrome131"
 BASE_URL = "https://claude.ai"
 
 CONCURRENCY = 5
-"""Hard cap on async fan-out per Section 3 constraint #4."""
+"""Hard cap on async fan-out. Real consumer accounts hit /completion sliding
+windows fast above 5 parallel; the cap also limits Cloudflare burst-detection
+exposure."""
 
-INTER_BATCH_SLEEP_SEC = 0.5
 RESTORE_CHAT_SLEEP_SEC = 90.0
-"""Per-chat sleep during restore. The brief targeted 1.0s, but real consumer
-accounts have a sliding /completion rate window that 30s wasn't long enough
-to respect — empirically 90s/chat keeps 429s rare. Override via
-CLAUDE_MIGRATE_CHAT_SLEEP_SEC."""
+"""Per-chat sleep during restore. Empirically 90s/chat keeps 429s rare on
+real consumer accounts whose /completion rate window is longer than the 30s
+documentation suggests. Override via CLAUDE_MIGRATE_CHAT_SLEEP_SEC."""
 
 RESTORE_CHAT_RATE_LIMIT_SLEEP_SEC = 300.0
 """Extra cool-down when /completion returns 429. 5 minutes lets the sliding
@@ -64,11 +64,16 @@ def data_dir() -> Path:
 
 
 class Settings(BaseSettings):
-    """Pydantic-settings — reads env CLAUDE_MIGRATE_* and config.toml."""
+    """Pydantic-settings — reads env CLAUDE_MIGRATE_* and config.toml.
+
+    The TOML path is resolved per-instance via `settings_customise_sources`
+    rather than via `model_config["toml_file"]`, which would freeze the path
+    to whatever XDG_CONFIG_HOME held the moment this module was imported —
+    breaking tests and any code that swaps env vars after import.
+    """
 
     model_config = SettingsConfigDict(
         env_prefix="CLAUDE_MIGRATE_",
-        toml_file=config_dir() / "config.toml",
         extra="ignore",
     )
 
@@ -97,11 +102,13 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # env > toml > defaults
+        # Priority: init kwargs > env > toml > file secrets > defaults.
+        # toml_file is computed *here*, at instantiation, so XDG_CONFIG_HOME
+        # changes (e.g. test fixtures) take effect.
         return (
             init_settings,
             env_settings,
-            TomlConfigSettingsSource(settings_cls),
+            TomlConfigSettingsSource(settings_cls, toml_file=config_dir() / "config.toml"),
             file_secret_settings,
         )
 

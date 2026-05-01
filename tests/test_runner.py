@@ -176,9 +176,9 @@ async def test_pacer_before_blocks_until_pause_window_passes() -> None:
             return fake_now[0]
 
     real_sleep = asyncio.sleep
-    real_get_loop = asyncio.get_event_loop
+    real_get_loop = asyncio.get_running_loop
     asyncio.sleep = fake_sleep  # type: ignore[assignment]
-    asyncio.get_event_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
+    asyncio.get_running_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
     try:
         pacer = Pacer(base_sleep_sec=0.0, rate_limit_sleep_sec=100.0)
         await pacer.after(WorkerOutcome.failed("429", rate_limited=True))
@@ -186,7 +186,7 @@ async def test_pacer_before_blocks_until_pause_window_passes() -> None:
         await pacer.before()
     finally:
         asyncio.sleep = real_sleep  # type: ignore[assignment]
-        asyncio.get_event_loop = real_get_loop  # type: ignore[assignment]
+        asyncio.get_running_loop = real_get_loop  # type: ignore[assignment]
     assert sleeps == [100.0]
 
 
@@ -204,9 +204,9 @@ async def test_pacer_cooldown_grows_with_consecutive_429s() -> None:
             return fake_now[0]
 
     real_sleep = asyncio.sleep
-    real_get_loop = asyncio.get_event_loop
+    real_get_loop = asyncio.get_running_loop
     asyncio.sleep = fake_sleep  # type: ignore[assignment]
-    asyncio.get_event_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
+    asyncio.get_running_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
     try:
         pacer = Pacer(base_sleep_sec=0.0, rate_limit_sleep_sec=100.0, max_cooldown_sec=400.0)
         for _ in range(5):
@@ -214,7 +214,7 @@ async def test_pacer_cooldown_grows_with_consecutive_429s() -> None:
             await pacer.before()
     finally:
         asyncio.sleep = real_sleep  # type: ignore[assignment]
-        asyncio.get_event_loop = real_get_loop  # type: ignore[assignment]
+        asyncio.get_running_loop = real_get_loop  # type: ignore[assignment]
     # Each before() sleeps for the *remaining* pause; with no real time passing
     # except via fake_sleep, after the 1st 429 pause_until = 1000+100 = 1100,
     # before() sleeps 100, fake_now=1100. After 2nd 429 (consecutive=2),
@@ -236,9 +236,9 @@ async def test_pacer_success_resets_cooldown_counter() -> None:
             return fake_now[0]
 
     real_sleep = asyncio.sleep
-    real_get_loop = asyncio.get_event_loop
+    real_get_loop = asyncio.get_running_loop
     asyncio.sleep = fake_sleep  # type: ignore[assignment]
-    asyncio.get_event_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
+    asyncio.get_running_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
     try:
         pacer = Pacer(base_sleep_sec=0.0, rate_limit_sleep_sec=100.0)
         await pacer.after(WorkerOutcome.failed("429", rate_limited=True))
@@ -248,7 +248,7 @@ async def test_pacer_success_resets_cooldown_counter() -> None:
         await pacer.before()  # sleeps 100 again (fresh, not 200)
     finally:
         asyncio.sleep = real_sleep  # type: ignore[assignment]
-        asyncio.get_event_loop = real_get_loop  # type: ignore[assignment]
+        asyncio.get_running_loop = real_get_loop  # type: ignore[assignment]
     assert pause_seen == [100.0, 100.0]
 
 
@@ -267,9 +267,9 @@ async def test_pacer_skipped_row_is_no_op() -> None:
             return fake_now[0]
 
     real_sleep = asyncio.sleep
-    real_get_loop = asyncio.get_event_loop
+    real_get_loop = asyncio.get_running_loop
     asyncio.sleep = fake_sleep  # type: ignore[assignment]
-    asyncio.get_event_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
+    asyncio.get_running_loop = lambda: FakeLoop()  # type: ignore[assignment,return-value]
     try:
         pacer = Pacer(base_sleep_sec=2.0, rate_limit_sleep_sec=300.0)
         # Build up a cooldown counter, skip a row, then 429 again — the skip
@@ -281,5 +281,5 @@ async def test_pacer_skipped_row_is_no_op() -> None:
         await pacer.before()                                               # sleep 600
     finally:
         asyncio.sleep = real_sleep  # type: ignore[assignment]
-        asyncio.get_event_loop = real_get_loop  # type: ignore[assignment]
+        asyncio.get_running_loop = real_get_loop  # type: ignore[assignment]
     assert pause_seen == [300.0, 600.0]

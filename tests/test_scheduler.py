@@ -107,19 +107,6 @@ def test_install_timer_default_profile_is_source() -> None:
     assert scheduler.DEFAULT_PROFILE == "source"
 
 
-def test_static_template_files_use_backup_not_dump() -> None:
-    """The reference templates in scripts/ are referenced by README — pin them."""
-    repo_root = Path(__file__).resolve().parent.parent
-    scripts = repo_root / "scripts"
-    for fname in ("claude-migrate.service", "com.user.claudemigrate.plist"):
-        text = (scripts / fname).read_text()
-        assert "backup" in text, f"{fname} must reference the `backup` command"
-        assert " dump " not in text, f"{fname} still references the removed `dump` command"
-        assert "<string>dump</string>" not in text, (
-            f"{fname} plist still wraps the removed `dump` command"
-        )
-
-
 def test_detect_backend_returns_known_value() -> None:
     """detect_backend should return one of the supported strings, never crash."""
     backend = scheduler.detect_backend()

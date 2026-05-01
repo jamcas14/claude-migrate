@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from datetime import UTC, datetime
+from collections.abc import Coroutine
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, NoReturn
 
 import click
 import structlog
@@ -140,13 +142,17 @@ def _setup_logging(quiet: bool, verbose: bool) -> None:
     )
 
 
-def _run(coro: object) -> object:
-    """Run an async coroutine with friendly mapping of typed errors → exit codes."""
+def _run[T](coro: Coroutine[Any, Any, T]) -> T:
+    """Run a coroutine, mapping typed errors → friendly exit codes.
+
+    On any caught error the function exits the process via `sys.exit`, so the
+    declared return type holds: callers receive `T` or never return.
+    """
     try:
-        return asyncio.run(coro)  # type: ignore[arg-type]
+        return asyncio.run(coro)
     except KeyboardInterrupt:
         click.echo("\nInterrupted.", err=True)
-        sys.exit(130)
+        _exit(130)
     except AuthExpired as e:
         click.echo(f"\nSession expired: {e}", err=True)
         click.echo(
@@ -155,7 +161,7 @@ def _run(coro: object) -> object:
             err=True,
         )
         notify("claude-migrate", "Session expired — re-auth required.")
-        sys.exit(EXIT_TEMPFAIL)
+        _exit(EXIT_TEMPFAIL)
     except CloudflareChallenge as e:
         click.echo(f"\nCloudflare challenge: {e}", err=True)
         click.echo(
@@ -163,7 +169,7 @@ def _run(coro: object) -> object:
             "fresh cf_clearance), then `claude-migrate add <profile>`.",
             err=True,
         )
-        sys.exit(EXIT_TEMPFAIL)
+        _exit(EXIT_TEMPFAIL)
     except ClientVersionStale as e:
         settings = load_settings()
         click.echo(f"\n{e}", err=True)
@@ -172,19 +178,25 @@ def _run(coro: object) -> object:
             err=True,
         )
         click.echo(CLIENT_VERSION_HELP, err=True)
-        sys.exit(EXIT_TEMPFAIL)
+        _exit(EXIT_TEMPFAIL)
     except (AuthInvalid, AuthMissing) as e:
         click.echo(f"\n{e}", err=True)
-        sys.exit(2)
+        _exit(2)
     except AuthError as e:
         click.echo(f"\nAuth error: {e}", err=True)
-        sys.exit(2)
+        _exit(2)
     except NetworkError as e:
         click.echo(f"\nNetwork error: {e}", err=True)
-        sys.exit(EXIT_TEMPFAIL)
+        _exit(EXIT_TEMPFAIL)
     except ClaudeMigrateError as e:
         click.echo(f"\nError: {e}", err=True)
-        sys.exit(1)
+        _exit(1)
+
+
+def _exit(code: int) -> NoReturn:
+    """Indirection so mypy sees `_run` as `T | NoReturn`. Inlined would let mypy
+    fall through past the except blocks and infer an implicit `None` return."""
+    sys.exit(code)
 
 
 def _ensure_tos(ack: bool) -> None:
@@ -305,14 +317,10 @@ def whoami(name: str) -> None:
     """Hits /api/bootstrap with the stored cookies, prints the authenticated
     identity, and updates the profile's `last_probe_ok` timestamp on success."""
     result = _run(verify_profile(name))
-    if result is None:
-        click.echo(f"\nVerification of {name!r} did not return a result.", err=True)
-        click.echo(f"Run `claude-migrate add {name}` to re-paste cookies.", err=True)
-        sys.exit(1)
     p = load_profile(name)
     click.echo(f"  ✓ {p.email or 'unknown email'}")
-    if getattr(result, "org_name", None):
-        click.echo(f"    organization:  {result.org_name}")  # type: ignore[attr-defined]
+    if result.org_name:
+        click.echo(f"    organization:  {result.org_name}")
     click.echo(f"    last probe ok: {p.last_probe_ok}")
 
 
@@ -416,8 +424,10 @@ def migrate(
     _ensure_tos(tos_ack)
     ensure_data_dir()
 
-    # Step 1: backup source (skippable for "I just want to push existing archive")
-    if not skip_backup:
+    # Step 1: backup source (skippable for "I just want to push existing archive").
+    # --dry-run implies skip-backup: a "preview" that pulls every conversation
+    # from claude.ai is a contradiction in terms.
+    if not skip_backup and not dry_run:
         click.echo(f"Step 1/3: backup source ({source})")
 
         async def _backup() -> None:
@@ -442,17 +452,15 @@ def migrate(
 
         _run(_backup())
         click.echo("")
+    elif dry_run and not skip_backup:
+        click.echo(
+            f"Step 1/3: backup source ({source}) — skipped (dry-run)"
+        )
+        click.echo("")
 
     # Step 2: show the plan (always)
     click.echo(f"Step 2/3: plan against target ({target})")
     plan = _run(dry_run_plan(target_profile=target))
-    if not isinstance(plan, dict):
-        click.echo(
-            "Could not compute migration plan — run `claude-migrate backup "
-            f"{source}` first to populate the local archive.",
-            err=True,
-        )
-        sys.exit(1)
 
     def _row(label: str, pending: int, total: int, enabled: bool) -> str:
         done = total - pending
@@ -487,12 +495,8 @@ def migrate(
         async with open_session(target) as session:
             return session.email, session.org_name
 
-    confirmation = _run(_confirm_target())
-    if isinstance(confirmation, tuple):
-        email, org_name = confirmation
-        target_label = f"{email or '?'}{f' ({org_name})' if org_name else ''}"
-    else:
-        target_label = target
+    email, org_name = _run(_confirm_target())
+    target_label = f"{email or '?'}{f' ({org_name})' if org_name else ''}"
 
     click.echo("")
     click.echo(f"Step 3/3: about to migrate to {target_label}.")
@@ -512,22 +516,19 @@ def migrate(
         do_conversations=conversations,
         concurrency=concurrency,
     ))
-    if summary is None:
-        click.echo("Restore did not return a summary (it may have aborted early).", err=True)
-        sys.exit(1)
 
     click.echo("\nDone.")
     if prefs:
-        flag = "✓" if getattr(summary, "profile_prefs", False) else "—"
+        flag = "✓" if summary.profile_prefs else "—"
         click.echo(f"  prefs:                  {flag}")
     if styles:
-        click.echo(f"  styles migrated:        {summary.styles_migrated}/{summary.styles_total}")  # type: ignore[attr-defined]
+        click.echo(f"  styles migrated:        {summary.styles_migrated}/{summary.styles_total}")
     if projects:
-        click.echo(f"  projects migrated:      {summary.projects_migrated}/{summary.projects_total}")  # type: ignore[attr-defined]
+        click.echo(f"  projects migrated:      {summary.projects_migrated}/{summary.projects_total}")
     if conversations:
-        click.echo(f"  conversations migrated: {summary.conversations_migrated}/{summary.conversations_total}")  # type: ignore[attr-defined]
-    click.echo(f"  skipped (already done): {summary.skipped}")  # type: ignore[attr-defined]
-    failed = getattr(summary, "failed", []) or []
+        click.echo(f"  conversations migrated: {summary.conversations_migrated}/{summary.conversations_total}")
+    click.echo(f"  skipped (already done): {summary.skipped}")
+    failed = summary.failed
     if failed:
         click.echo(f"\n  failures: {len(failed)} — first few:")
         for src_uuid, err in failed[:5]:
@@ -576,9 +577,6 @@ def verify(target: str, reconcile: bool) -> None:
     result = _run(verify_target_conversations(
         target_profile=target, reconcile=reconcile,
     ))
-    if not isinstance(result, dict):
-        click.echo("Verification could not run (auth or network issue).", err=True)
-        sys.exit(1)
     click.echo(f"  target: {result['email']}")
     click.echo(f"  ✓ {result['confirmed']} confirmed on target")
     missing = result["missing"]
@@ -630,10 +628,7 @@ def reorder(target: str, dry_run: bool, skip_prompt: bool) -> None:
                 conn.close()
         return email, org, touched, missing
 
-    result = _run(preview())
-    if not isinstance(result, tuple):
-        return
-    email, org, touched, missing = result
+    email, org, touched, missing = _run(preview())
     click.echo(f"  target: {email} ({org[:8]}...)")
     click.echo(f"  would touch {touched} chat(s)")
     if missing:
@@ -670,6 +665,38 @@ def reorder(target: str, dry_run: bool, skip_prompt: bool) -> None:
     _run(run())
 
 
+def _parse_window_arg(s: str) -> datetime:
+    """Parse a --since/--until argument for `cleanup`.
+
+    Accepts: ``2026-04-30``, ``2026-04-30T14:37``, ``2026-04-30T14:37:00``, with
+    optional ``Z`` or ``+HH:MM`` / ``-HH:MM`` offset. Bare-naive input is
+    interpreted as UTC; tz-aware input is converted to UTC so window
+    comparisons against API ISO timestamps are consistent without silently
+    rewriting the user's intended offset.
+    """
+    s = s.strip()
+    if "T" not in s:
+        s = s + "T00:00:00"
+    date_part, time_and_tz = s.split("T", 1)
+    # Find where the tz suffix begins (Z / + / - that follows HH:MM).
+    tz_pos = -1
+    for sep in ("Z", "+"):
+        i = time_and_tz.find(sep)
+        if i > 0:
+            tz_pos = i
+            break
+    if tz_pos == -1:
+        i = time_and_tz.rfind("-")
+        if i >= 4:  # past at least HH:MM (so we don't mistake the year sep)
+            tz_pos = i
+    time_part = time_and_tz if tz_pos == -1 else time_and_tz[:tz_pos]
+    tz_part = "" if tz_pos == -1 else time_and_tz[tz_pos:]
+    if time_part.count(":") == 1:
+        time_part += ":00"
+    dt = datetime.fromisoformat(f"{date_part}T{time_part}{tz_part}")
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
 @cli.command(help="Delete empty conversations on TARGET created during a failed run.")
 @click.argument("target")
 @click.option(
@@ -694,19 +721,11 @@ def cleanup(
 
     Asks `Proceed? [y/N]` before deleting. `--dry-run` lists orphans without
     prompting; `--yes` skips the prompt for automation."""
-    from datetime import UTC, datetime, timedelta
-
-    def _parse(s: str) -> datetime:
-        s = s.strip().rstrip("Z")
-        if "T" not in s:
-            s = s + "T00:00:00"
-        if s.count(":") == 1:
-            s = s + ":00"
-        return datetime.fromisoformat(s).replace(tzinfo=UTC)
-
     try:
-        since_dt = _parse(since_iso)
-        until_dt = _parse(until_iso) if until_iso else since_dt + timedelta(hours=1)
+        since_dt = _parse_window_arg(since_iso)
+        until_dt = (
+            _parse_window_arg(until_iso) if until_iso else since_dt + timedelta(hours=1)
+        )
     except ValueError as e:
         click.echo(
             f"Could not parse time bound: {e}\n"
@@ -733,15 +752,12 @@ def cleanup(
             )
             return session.email or "?", session.org_uuid, orphans
 
-    scan_result = _run(scan())
-    if not isinstance(scan_result, tuple):
-        return
-    email, _org_uuid, orphans = scan_result
+    email, _org_uuid, orphans = _run(scan())
     click.echo(f"  confirmed orphans: {len(orphans)}")
     for c in orphans[:20]:
-        click.echo(
-            f"    {c.get('uuid', '?')[:8]}  created {c.get('created_at', '?')}"
-        )
+        cu = str(c.get("uuid") or "?")
+        ca = c.get("created_at") or "?"
+        click.echo(f"    {cu[:8]}  created {ca}")
     if len(orphans) > 20:
         click.echo(f"    ... and {len(orphans) - 20} more")
 

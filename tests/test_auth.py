@@ -1,4 +1,4 @@
-"""Exhaustive tests for the auth normalizer and format validators (Section 7.2/7.3)."""
+"""Exhaustive tests for the auth normalizer and format validators."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ VALID_CF = "Zk0c.W3" + "A" * 50  # 57 chars
 
 
 # ---------------------------------------------------------------------------
-# Normalizer — every row in Section 7.2 plus a few extras
+# Normalizer — every common paste shape
 # ---------------------------------------------------------------------------
 
 

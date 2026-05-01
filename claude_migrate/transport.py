@@ -18,12 +18,7 @@ import json
 from curl_cffi import CurlMime
 
 from .client import ClaudeClient
-from .errors import (
-    AuthExpired,
-    CloudflareChallenge,
-    NetworkError,
-    SchemaDrift,
-)
+from .errors import NetworkError, SchemaDrift
 from .render import (
     AttachmentPayload,
     ChunkedPayload,
@@ -98,6 +93,11 @@ async def send_payload(
                     {"prompt": chunk + marker + tail, "attachments": [], "files": []},
                     early_cancel=early_cancel and final,
                 )
+        case _:
+            raise SchemaDrift(
+                f"transport.send_payload received unsupported payload type "
+                f"{type(payload).__name__}; update the match arms in transport.py"
+            )
 
 
 async def _await_completion(
@@ -120,43 +120,40 @@ async def _await_completion(
     "READY" reply being truncated is fine for migration purposes.
     """
     saw_stop = False
-    try:
-        async for line in client.stream(
-            "POST",
-            f"/api/organizations/{target_org}/chat_conversations/{conv_uuid}/completion",
-            json_body=body,
-            timeout=SSE_TIMEOUT,
+    async for line in client.stream(
+        "POST",
+        f"/api/organizations/{target_org}/chat_conversations/{conv_uuid}/completion",
+        json_body=body,
+        timeout=SSE_TIMEOUT,
+    ):
+        if not line.startswith("data:"):
+            continue
+        payload_text = line[5:].strip()
+        if not payload_text or payload_text == "[DONE]":
+            saw_stop = True
+            continue
+        try:
+            evt = json.loads(payload_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(evt, dict):
+            continue
+        # Terminal events end the wait under both modes.
+        if evt.get("stop_reason"):
+            saw_stop = True
+            break
+        if evt.get("type") in ("message_stop", "message_complete"):
+            saw_stop = True
+            break
+        # Early-cancel: any non-terminal model event proves the user
+        # message was committed; drop the connection to free wall clock.
+        if early_cancel and (
+            evt.get("type")
+            in ("message_start", "content_block_start", "content_block_delta")
+            or "completion" in evt
         ):
-            if not line.startswith("data:"):
-                continue
-            payload_text = line[5:].strip()
-            if not payload_text or payload_text == "[DONE]":
-                saw_stop = True
-                continue
-            try:
-                evt = json.loads(payload_text)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(evt, dict):
-                continue
-            # Terminal events end the wait under both modes.
-            if evt.get("stop_reason"):
-                saw_stop = True
-                break
-            if evt.get("type") in ("message_stop", "message_complete"):
-                saw_stop = True
-                break
-            # Early-cancel: any non-terminal model event proves the user
-            # message was committed; drop the connection to free wall clock.
-            if early_cancel and (
-                evt.get("type")
-                in ("message_start", "content_block_start", "content_block_delta")
-                or "completion" in evt
-            ):
-                saw_stop = True
-                break
-    except (NetworkError, AuthExpired, CloudflareChallenge):
-        raise
+            saw_stop = True
+            break
     if not saw_stop:
         raise NetworkError("completion stream ended without a stop signal")
 

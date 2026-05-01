@@ -1,8 +1,10 @@
 """Async fan-out: orgs → projects → docs → conversations → messages → files.
 
-Concurrency is gated by the client's Semaphore(5). The `chat_conversations`
-list endpoint is fetched serially per Section 8 to avoid windowing
-inconsistencies; detail pages run under the semaphore.
+Concurrency is gated by the client's Semaphore. The `chat_conversations`
+list endpoint is fetched serially because parallel paginated reads against
+that endpoint return inconsistent windows (the cursor advances per response
+rather than as a stable snapshot); per-conversation detail pages run under
+the semaphore.
 """
 
 from __future__ import annotations
@@ -114,7 +116,8 @@ async def fetch_project_docs(
 async def fetch_conversation_list(
     client: ClaudeClient, org_uuid: str
 ) -> list[dict[str, Any]]:
-    """Serial pagination per Section 8 — windowing is unstable under parallelism."""
+    """Serial pagination — parallel reads against this endpoint return
+    inconsistent windows because the cursor isn't snapshot-stable."""
     out: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:

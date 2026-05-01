@@ -100,8 +100,18 @@ class RestoreState:
         ).fetchone()
         return int(row[0])
 
+    _PENDING_TABLES = frozenset({"project", "custom_style", "conversation"})
+
     def pending_count(self, source_table: str) -> int:
         """Rows in `source_table` that don't yet have a status='ok' log entry."""
+        # Whitelist guard: source_table is interpolated into SQL, so refuse
+        # anything we don't recognize. Belt-and-suspenders against future
+        # callers passing an attacker-controlled value.
+        if source_table not in self._PENDING_TABLES:
+            raise ValueError(
+                f"pending_count: refusing unknown table {source_table!r}; "
+                f"allowed: {sorted(self._PENDING_TABLES)}"
+            )
         row = self.conn.execute(
             f"SELECT COUNT(*) FROM {source_table} t "
             "WHERE NOT EXISTS ("
