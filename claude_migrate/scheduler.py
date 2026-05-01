@@ -17,6 +17,13 @@ UNIT_NAME = "claude-migrate"
 LAUNCHD_LABEL = "com.user.claudemigrate"
 DEFAULT_PROFILE = "source"
 
+# Dict-keyed lookup so mypy doesn't statically narrow `sys.platform` and flag
+# the non-host branches as unreachable under `warn_unreachable`.
+_FIXED_BACKENDS: dict[str, str] = {
+    "darwin": "launchd",
+    "win32": "task_scheduler",
+}
+
 
 @dataclass
 class TimerStatus:
@@ -26,10 +33,8 @@ class TimerStatus:
 
 
 def detect_backend() -> str:
-    if sys.platform == "darwin":
-        return "launchd"
-    if sys.platform == "win32":
-        return "task_scheduler"
+    if backend := _FIXED_BACKENDS.get(sys.platform):
+        return backend
     if shutil.which("systemctl"):
         return "systemd"
     if shutil.which("crontab"):

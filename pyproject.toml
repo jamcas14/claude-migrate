@@ -101,4 +101,9 @@ asyncio_mode = "auto"
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning:pydantic.*",
+    # GC-collected ResourceWarnings from third-party teardown timing on the
+    # Ubuntu CI runner (keyring/dbus probing, pytest-asyncio loop reaper).
+    # Not raised in our test code; suppressing the unraisable-collector class
+    # keeps every other warning fatal.
+    "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
