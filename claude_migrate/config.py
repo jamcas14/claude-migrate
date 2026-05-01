@@ -38,10 +38,12 @@ CONCURRENCY = 5
 windows fast above 5 parallel; the cap also limits Cloudflare burst-detection
 exposure."""
 
-RESTORE_CHAT_SLEEP_SEC = 90.0
-"""Per-chat sleep during restore. Empirically 90s/chat keeps 429s rare on
-real consumer accounts whose /completion rate window is longer than the 30s
-documentation suggests. Override via CLAUDE_MIGRATE_CHAT_SLEEP_SEC."""
+RESTORE_CHAT_SLEEP_SEC = 30.0
+"""Per-chat sleep ceiling during restore. The Pacer's AIMD controller starts
+at `base_min` (5s) and only ramps up toward this value when 429s appear, so
+this is the *upper bound* — accounts that don't hit the limit run at 5s/chat,
+heavily-throttled accounts adapt up to 30s. Override via
+CLAUDE_MIGRATE_CHAT_SLEEP_SEC."""
 
 RESTORE_CHAT_RATE_LIMIT_SLEEP_SEC = 300.0
 """Extra cool-down when /completion returns 429. 5 minutes lets the sliding

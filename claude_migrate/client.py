@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import json
 import random
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import structlog
@@ -30,6 +32,35 @@ log = structlog.get_logger(__name__)
 # 429 backoff schedule: 2 → 4 → 8 → 16 → 32 → 60s (cap), max 3 retries.
 BACKOFF_SCHEDULE = (2, 4, 8, 16, 32, 60)
 MAX_RETRIES = 3
+
+# Retry-After header may be either integer seconds ("120") or HTTP-date.
+# Clamp the parsed value so a misconfigured edge sending Retry-After:86400
+# can't wedge the run for a day. Lower bound matches BACKOFF_SCHEDULE[0].
+_RETRY_AFTER_MIN = 2.0
+_RETRY_AFTER_MAX = 600.0
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header. Returns None if absent or unparseable.
+
+    Accepts integer-seconds (RFC 7231 form 1) or HTTP-date (form 2). Clamps
+    to [_RETRY_AFTER_MIN, _RETRY_AFTER_MAX] so a malformed/extreme value
+    can't push the cooldown into "wait a day" territory.
+    """
+    if not value:
+        return None
+    s = value.strip()
+    try:
+        secs = float(int(s))  # form 1: integer seconds
+    except ValueError:
+        try:
+            dt = email.utils.parsedate_to_datetime(s)
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        secs = (dt - datetime.now(UTC)).total_seconds()
+    return max(_RETRY_AFTER_MIN, min(_RETRY_AFTER_MAX, secs))
 
 
 @dataclass(frozen=True)
@@ -202,10 +233,36 @@ class ClaudeClient:
                     "stale or missing `anthropic-client-version` / `anthropic-client-sha` header."
                 )
             if status == 429:
+                # Empirical instrumentation: capture rate-limit signaling so
+                # the orchestrator's Pacer (and any future tuning) can see
+                # what claude.ai actually sends. Cheap; one log line.
+                retry_after_hdr = _resp_header(resp, "Retry-After")
+                retry_after_sec = _parse_retry_after(retry_after_hdr)
+                log.info(
+                    "rate_limit_observed",
+                    path=path, attempt=attempt,
+                    retry_after_header=retry_after_hdr,
+                    retry_after_parsed_sec=retry_after_sec,
+                    ratelimit_remaining=_resp_header(
+                        resp, "anthropic-ratelimit-requests-remaining"
+                    ),
+                    ratelimit_reset=_resp_header(
+                        resp, "anthropic-ratelimit-tokens-reset"
+                    ),
+                    body_preview=text_preview[:200],
+                )
                 if attempt > MAX_RETRIES:
-                    raise RateLimited(f"429 after {MAX_RETRIES} retries")
-                base = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
-                delay = base + random.uniform(0, 0.5)
+                    raise RateLimited(
+                        f"429 after {MAX_RETRIES} retries",
+                        retry_after_sec=retry_after_sec,
+                    )
+                # Prefer the server's Retry-After when present; fall back to
+                # the capped exponential schedule otherwise.
+                if retry_after_sec is not None:
+                    delay = retry_after_sec + random.uniform(0, 0.5)
+                else:
+                    base = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
+                    delay = base + random.uniform(0, 0.5)
                 log.warning("rate_limited", path=path, retry_in_sec=delay)
                 await asyncio.sleep(delay)  # outside _sem — see docstring
                 continue
@@ -307,19 +364,31 @@ class ClaudeClient:
                             "/ `anthropic-client-sha` header."
                         )
                     if status == 429:
-                        if attempt > MAX_RETRIES:
-                            raise RateLimited(
-                                f"stream {path} 429 after {MAX_RETRIES} retries"
-                            )
-                        base = BACKOFF_SCHEDULE[
-                            min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)
-                        ]
-                        retry_after = base + random.uniform(0, 0.5)
-                        log.warning(
-                            "stream_rate_limited", path=path,
-                            retry_in_sec=retry_after,
+                        # Drop the inner-retry on 429: /completion is the only
+                        # caller of stream(), and the conversation-restore
+                        # loop already retries via its outer Pacer with proper
+                        # cooldown. Inner retries here just burn 14s of sleep
+                        # before the real cooldown kicks in. Surface the
+                        # server's Retry-After so the Pacer can use it.
+                        retry_after_hdr = _resp_header(resp, "Retry-After")
+                        retry_after_sec = _parse_retry_after(retry_after_hdr)
+                        log.info(
+                            "rate_limit_observed",
+                            path=path, attempt=attempt,
+                            retry_after_header=retry_after_hdr,
+                            retry_after_parsed_sec=retry_after_sec,
+                            ratelimit_remaining=_resp_header(
+                                resp, "anthropic-ratelimit-requests-remaining"
+                            ),
+                            ratelimit_reset=_resp_header(
+                                resp, "anthropic-ratelimit-tokens-reset"
+                            ),
                         )
-                    elif 500 <= status < 600:
+                        raise RateLimited(
+                            f"stream {path} returned 429",
+                            retry_after_sec=retry_after_sec,
+                        )
+                    if 500 <= status < 600:
                         if attempt > MAX_RETRIES:
                             raise NetworkError(
                                 f"stream {path} {status} after retries"
@@ -357,6 +426,26 @@ class ClaudeClient:
             # branches either returned (happy) or raised.
             assert retry_after is not None
             await asyncio.sleep(retry_after)
+
+
+def _resp_header(resp: Any, name: str) -> str | None:
+    """Look up a response header by name, case-insensitive, defensively.
+
+    curl_cffi exposes headers via `resp.headers` (a dict-like). Callers like
+    `request()` and `stream()` need it; tests mock `resp` with a minimal
+    interface that may not have `headers`. Return None if it's missing.
+    """
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return None
+    try:
+        # Most dict-like header containers are case-insensitive.
+        val = headers.get(name)
+    except (AttributeError, TypeError):
+        return None
+    if isinstance(val, str):
+        return val
+    return None
 
 
 async def _read_body_preview(resp: Any, *, max_bytes: int = 400) -> str:

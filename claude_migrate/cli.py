@@ -88,6 +88,59 @@ def _profile_arg_callback(
         raise click.BadParameter(str(e)) from e
     return value
 
+
+def _complete_profile_name(
+    ctx: click.Context, param: click.Parameter, incomplete: str,
+) -> list[str]:
+    """Click shell-completion callback. Returns stored profile names that
+    match the user's partial input. Reads `profiles.index` (auth.list_profiles)
+    once per <Tab>; ~1ms disk read. No network."""
+    try:
+        return [n for n in list_profiles() if n.startswith(incomplete)]
+    except Exception:
+        # Never let completion errors break the shell. Return empty on any failure.
+        return []
+
+
+def _maybe_warn_peak_hours() -> None:
+    """Print a banner if the user is starting a migration during Anthropic's
+    peak window (Mon-Fri 13:00-19:00 UTC). The 5-hour usage bucket drains
+    ~2x faster during peak — running off-peak is the cheapest speedup."""
+    now = datetime.now(UTC)
+    weekday = now.weekday()  # 0 = Monday, 6 = Sunday
+    if weekday < 5 and 13 <= now.hour < 19:
+        click.echo(
+            "  ⚠ You're running during Anthropic's peak hours "
+            "(Mon-Fri 13:00-19:00 UTC). The 5-hour usage bucket drains "
+            "~2x faster now. For maximum throughput, consider running on "
+            "a weekend morning UTC.\n",
+            err=True,
+        )
+
+
+def _print_duration_estimate(pending_chats: int, concurrency: int) -> None:
+    """Pre-flight expectation-setting for `migrate`. Anthropic Pro plans cap
+    /completion at ~45 messages per 5-hour rolling window; with realistic
+    pacing the wall clock is dominated by that bucket, NOT by client-side
+    sleeps. Set the user's expectations honestly so they don't silently
+    abort after 20 minutes wondering why it's so slow."""
+    if pending_chats <= 0:
+        return
+    pro_per_window = 45
+    # Naive estimate assuming the user is on Pro. Round up to whole windows.
+    windows = max(1, (pending_chats + pro_per_window - 1) // pro_per_window)
+    hours_min = windows * 5  # 5h per window, hard wall
+    click.echo(
+        f"  Pending: {pending_chats} chats, concurrency={concurrency}.\n"
+        f"  Anthropic's Pro plan caps /completion at ~45 messages per "
+        f"5-hour rolling window. {pending_chats} chats need ≥{windows} "
+        f"window(s) ≈ {hours_min}+ hours wall-clock.\n"
+        f"  • Max 5x ($100/month) raises the cap to ~225/window — your run "
+        f"would finish in {(pending_chats + 224) // 225} window(s).\n"
+        f"  • `--archive-only` bundles every chat as a markdown doc in one "
+        f"Project on target. No /completion calls; finishes in minutes.\n"
+    )
+
 TOS_BANNER = (
     "Heads up: Anthropic's Consumer Terms (§3.4 prohibits scraping, §3.7\n"
     "prohibits automation) restrict the kind of API access this tool performs.\n"
@@ -257,7 +310,7 @@ def cli(ctx: click.Context, quiet: bool, verbose: bool) -> None:
 
 
 @cli.command(help="Add a profile (interactive cookie paste).")
-@click.argument("name", callback=_profile_arg_callback)
+@click.argument("name", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 def add(name: str) -> None:
     """Adds a stored profile, or re-pastes cookies if NAME already exists.
     Idempotent — running against an existing name overwrites the stored
@@ -270,7 +323,7 @@ def add(name: str) -> None:
 
 
 @cli.command(help="Remove a stored profile from the OS keychain.")
-@click.argument("name", callback=_profile_arg_callback)
+@click.argument("name", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 @click.confirmation_option(prompt="Delete this profile from the keychain?")
 def remove(name: str) -> None:
     """Local-only — deletes the cookie blob from your keychain. Does NOT
@@ -309,8 +362,8 @@ def accounts() -> None:
 
 
 @cli.command(help="Rename a stored profile (no network call, no re-paste needed).")
-@click.argument("old_name", callback=_profile_arg_callback)
-@click.argument("new_name", callback=_profile_arg_callback)
+@click.argument("old_name", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
+@click.argument("new_name", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 def rename(old_name: str, new_name: str) -> None:
     """Local metadata operation. Useful for typo fixes (`source` → `soource`)
     or naming changes (`work` → `work-old`). The cookies and the discovered
@@ -353,7 +406,7 @@ def rename(old_name: str, new_name: str) -> None:
 
 
 @cli.command(help="Probe a profile to confirm its credentials still work.")
-@click.argument("name", callback=_profile_arg_callback)
+@click.argument("name", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 def whoami(name: str) -> None:
     """Hits /api/bootstrap with the stored cookies, prints the authenticated
     identity, and updates the profile's `last_probe_ok` timestamp on success."""
@@ -381,7 +434,7 @@ def _profile_exists(name: str) -> bool:
 
 
 @cli.command(help="Pull a profile's archive into local SQLite (incremental by default).")
-@click.argument("profile", callback=_profile_arg_callback)
+@click.argument("profile", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 @click.option("--full", "mode", flag_value="full", help="Re-fetch everything, ignore checkpoints.")
 @click.option("--incremental", "mode", flag_value="incremental",
               default=True, help="Only fetch changed objects (default).")
@@ -421,8 +474,8 @@ def backup(ctx: click.Context, profile: str, mode: str, tos_ack: bool) -> None:
 
 
 @cli.command(help="Migrate SOURCE's archive to TARGET. Asks `Proceed? [y/N]` before mutating.")
-@click.argument("source", callback=_profile_arg_callback)
-@click.argument("target", callback=_profile_arg_callback)
+@click.argument("source", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
+@click.argument("target", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 @click.option("--dry-run", is_flag=True,
               help="Show the plan and exit without prompting or running.")
 @click.option("--yes", "-y", "skip_prompt", is_flag=True,
@@ -437,7 +490,18 @@ def backup(ctx: click.Context, profile: str, mode: str, tos_ack: bool) -> None:
               help="Include chat conversations.")
 @click.option("--concurrency", type=click.IntRange(1, 5), default=1, show_default=True,
               help="Conversations to migrate in parallel (>1 trades Recents "
-              "ordering for speed; reorder runs automatically afterwards).")
+              "ordering for speed; reorder runs automatically afterwards). "
+              "On accounts with strict /completion rate limits, higher "
+              "concurrency may bunch failures rather than help; start at 1.")
+@click.option("--fast", is_flag=True,
+              help="Shortcut for --concurrency=3. Recents ordering is jumbled "
+              "during migration but auto-reorder runs at the end.")
+@click.option("--archive-only", is_flag=True,
+              help="Skip the per-chat /completion path entirely. Bundle every "
+              "conversation as a markdown doc in a single Project on TARGET. "
+              "Finishes in minutes (not hours), but chats live in one Project "
+              "instead of as individual entries in Recents. Trade-off: lose "
+              "per-chat continuation; gain ~150x speedup. No /completion calls.")
 @click.option("--skip-backup", is_flag=True,
               help="Skip the source backup step (use existing local archive).")
 @click.option("--skip-reorder", is_flag=True,
@@ -454,6 +518,8 @@ def migrate(
     projects: bool,
     conversations: bool,
     concurrency: int,
+    fast: bool,
+    archive_only: bool,
     skip_backup: bool,
     skip_reorder: bool,
     tos_ack: bool,
@@ -464,6 +530,19 @@ def migrate(
     prompting; `--yes` skips the prompt for automation."""
     _ensure_tos(tos_ack)
     ensure_data_dir()
+
+    # --fast is shorthand for --concurrency=3. If both are set, --concurrency wins.
+    if fast and concurrency == 1:
+        concurrency = 3
+        click.echo(
+            "  --fast set: running with concurrency=3. Recents ordering "
+            "will be jumbled during migration; auto-reorder fixes it at the end.\n"
+        )
+
+    # B9: Off-peak warning. Mon-Fri 13:00-19:00 UTC are Anthropic's peak
+    # hours; the 5-hour usage bucket drains ~2x faster. Warn so the user
+    # knows they can save real wall clock by running on a weekend morning.
+    _maybe_warn_peak_hours()
 
     # Step 1: backup source (skippable for "I just want to push existing archive").
     # --dry-run implies skip-backup: a "preview" that pulls every conversation
@@ -516,6 +595,14 @@ def migrate(
         plan["conversations_pending"], plan["conversations_total"], conversations,
     ))
 
+    # B10: realistic-expectation banner. Print only when conversations are
+    # actually being migrated and there's a non-trivial number — the
+    # Pro-plan 45-msg/5h wall is the dominant factor, and most users don't
+    # know it exists. Skip for archive-only mode (separate path, no /completion).
+    if conversations and not archive_only and plan["conversations_pending"] > 5:
+        click.echo("")
+        _print_duration_estimate(plan["conversations_pending"], concurrency)
+
     if dry_run:
         click.echo("\n(dry-run — no changes made)")
         return
@@ -528,6 +615,39 @@ def migrate(
     )
     if pending_total == 0:
         click.echo("\n  ✓ Nothing to migrate — target already matches archive.")
+        return
+
+    # Archive-only branches off here. It bundles every conversation as a
+    # markdown doc into a single Project on target. Skips /completion
+    # entirely — finishes in minutes, not hours. Trade-off: chats live in
+    # one Project, not as individual entries in Recents.
+    if archive_only:
+        click.echo("")
+        click.echo(
+            f"--archive-only set: bundling {plan['conversations_total']} "
+            f"conversation(s) as docs in one Project on {target}. No "
+            f"/completion calls, no per-chat rate limits."
+        )
+        if not skip_prompt and not click.confirm(
+            "Proceed?", default=False,
+        ):
+            click.echo("Aborted.")
+            return
+        from .archive import archive_to_project
+        result = _run(archive_to_project(target_profile=target))
+        click.echo("")
+        click.echo("Done.")
+        click.echo(f"  project:        {result.project_name}")
+        click.echo(f"  docs created:   {result.docs_created}")
+        if result.docs_failed:
+            click.echo(f"  docs failed:    {result.docs_failed}")
+            for uuid, err in result.failures[:5]:
+                click.echo(f"    {uuid[:8]} → {err}")
+        click.echo(
+            "\n  → On target, open the new Project and ask it questions. "
+            "Each conversation is a separate .md file searchable as project "
+            "knowledge."
+        )
         return
 
     # Probe target identity before any destructive call so the user can catch a
@@ -610,7 +730,7 @@ async def _reorder_run(profile: str) -> None:
 
 
 @cli.command(help="Probe each migrated chat on TARGET to confirm it's still there.")
-@click.argument("target", callback=_profile_arg_callback)
+@click.argument("target", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 @click.option("--reconcile", is_flag=True,
               help="Drop migration_log rows for chats no longer on target so the "
               "next migrate re-creates them.")
@@ -655,7 +775,7 @@ def verify(target: str, reconcile: bool) -> None:
 
 
 @cli.command(help="Re-PUT each migrated chat on TARGET in source updated_at order.")
-@click.argument("target", callback=_profile_arg_callback)
+@click.argument("target", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 @click.option("--dry-run", is_flag=True,
               help="Show how many chats would be touched and exit without prompting.")
 @click.option("--yes", "-y", "skip_prompt", is_flag=True,
@@ -752,7 +872,7 @@ def _parse_window_arg(s: str) -> datetime:
 
 
 @cli.command(help="Delete empty conversations on TARGET created during a failed run.")
-@click.argument("target", callback=_profile_arg_callback)
+@click.argument("target", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 @click.option(
     "--since", "since_iso", required=True,
     help="When the failed run started, e.g. 2026-04-30T14:37 (printed on the "
@@ -879,7 +999,7 @@ def preview(conversation_uuid: str, show_payload: bool) -> None:
 
 
 @cli.command(help="Show local archive vs target migration counts (no network calls).")
-@click.argument("target", callback=_profile_arg_callback)
+@click.argument("target", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
 def status(target: str) -> None:
     s = migration_status(target)
     archive = s["archive"]
@@ -1038,7 +1158,7 @@ def schedule() -> None:
 
 @schedule.command("install", help="Install the daily incremental backup timer.")
 @click.option("--profile", default="source", show_default=True,
-              callback=_profile_arg_callback,
+              callback=_profile_arg_callback, shell_complete=_complete_profile_name,
               help="Profile to back up daily.")
 def schedule_install(profile: str) -> None:
     s = install_timer(profile)

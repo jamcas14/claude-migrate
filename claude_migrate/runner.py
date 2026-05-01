@@ -29,19 +29,29 @@ class WorkerOutcome:
     Exactly one of `target_uuid` and `error` is set. `rate_limited=True` flags
     transient 429s so a `Pacer` can apply cooldown — this carries the type
     signal that used to be reconstructed by string-matching `"429" in err`.
+    `retry_after_sec` carries the server's `Retry-After` hint when present
+    so the Pacer can use it as the cooldown floor instead of a fixed schedule.
     """
 
     target_uuid: str | None
     error: str | None
     rate_limited: bool = False
+    retry_after_sec: float | None = None
 
     @classmethod
     def ok(cls, target_uuid: str) -> WorkerOutcome:
         return cls(target_uuid=target_uuid, error=None)
 
     @classmethod
-    def failed(cls, error: str, *, rate_limited: bool = False) -> WorkerOutcome:
-        return cls(target_uuid=None, error=error, rate_limited=rate_limited)
+    def failed(
+        cls, error: str, *,
+        rate_limited: bool = False,
+        retry_after_sec: float | None = None,
+    ) -> WorkerOutcome:
+        return cls(
+            target_uuid=None, error=error,
+            rate_limited=rate_limited, retry_after_sec=retry_after_sec,
+        )
 
 
 async def migrate_row(
@@ -80,28 +90,51 @@ async def migrate_row(
 
 @dataclass
 class Pacer:
-    """Pacing + 429 cooldown for a restore loop, serial or parallel.
+    """Adaptive pacing + 429 cooldown for a restore loop, serial or parallel.
 
     Two methods:
       * `before()` — call BEFORE issuing a request. Blocks if a 429 cooldown
         is active. Cheap when not paused (one lock acquisition).
       * `after(outcome)` — call AFTER the request returns. On rate-limited
-        outcome: bumps the pause window so future `before()` calls wait, and
-        returns immediately so the failed worker frees its slot fast. On
-        success: sleeps the base inter-call interval. On `outcome=None`
-        (skipped row): no-op.
+        outcome: extends the shared pause-until barrier (using the server's
+        `Retry-After` when present, the configured `rate_limit_sleep_sec`
+        floor otherwise) and adapts `_current_base` upward. On success:
+        adapts `_current_base` downward after a streak, then sleeps it.
+
+    AIMD on `_current_base`: doubles on each rate-limit, divides by 1.5 after
+    every 3 consecutive successes. Bounded `[base_min, base_max]`. Replaces
+    the previous fixed-base + 2** cooldown-multiplier scheme — two layered
+    AIMD systems overcorrect; pick one knob (the per-success base sleep) and
+    let cooldown be deterministic, driven by the server's signal.
 
     The pause window is a barrier shared across workers, not a sleep held by
-    the failed worker. That avoids the lock-held-during-cooldown deadlock
-    where every worker stalled behind a single 429.
+    the failed worker. Avoids the lock-held-during-cooldown deadlock where
+    every worker stalls behind a single 429.
     """
 
     base_sleep_sec: float
+    """Initial / maximum value of the adaptive `_current_base`. AIMD will
+    decrease below this on success streaks (down to `base_min`) and grow
+    back up to but not past this on rate-limits."""
+
     rate_limit_sleep_sec: float
+    """Cooldown floor used when the server didn't send `Retry-After`."""
+
+    base_min: float = 5.0
+    """Lower bound on the adaptive base sleep. 5s avoids hot-looping the API."""
+
     max_cooldown_sec: float = 600.0
-    _consecutive_rate_limits: int = field(default=0, init=False)
+    """Upper clamp on a single cooldown window."""
+
+    _current_base: float = field(default=0.0, init=False)
+    _consecutive_successes: int = field(default=0, init=False)
     _pause_until: float = field(default=0.0, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+
+    def __post_init__(self) -> None:
+        # Start at base_min so a fresh window can burst-fire; AIMD ramps up
+        # only when 429s appear. Caller's `base_sleep_sec` is the ceiling.
+        self._current_base = self.base_min
 
     async def before(self) -> None:
         """Block while a rate-limit pause is active. Cheap when not paused."""
@@ -114,26 +147,44 @@ class Pacer:
             await asyncio.sleep(wait)
 
     async def after(self, outcome: WorkerOutcome | None) -> None:
-        """Record outcome state and sleep the base interval on success."""
+        """Record outcome state and sleep the adaptive base on success."""
         if outcome is None:
             return
         if outcome.rate_limited:
             async with self._lock:
-                self._consecutive_rate_limits += 1
-                multiplier = min(2 ** (self._consecutive_rate_limits - 1), 4)
-                cooldown = min(
-                    self.rate_limit_sleep_sec * multiplier, self.max_cooldown_sec
+                self._consecutive_successes = 0
+                # AIMD: multiplicative increase on the per-success sleep,
+                # capped at the user's configured `base_sleep_sec` ceiling.
+                self._current_base = min(self._current_base * 2, self.base_sleep_sec)
+                if self._current_base < self.base_min:
+                    self._current_base = self.base_min
+                # Cooldown floor: server's Retry-After if available, else
+                # the configured fixed value. Clamp to max_cooldown_sec.
+                cooldown_raw = (
+                    outcome.retry_after_sec
+                    if outcome.retry_after_sec is not None
+                    else self.rate_limit_sleep_sec
                 )
+                cooldown = min(cooldown_raw, self.max_cooldown_sec)
                 pause_until = asyncio.get_running_loop().time() + cooldown
                 if pause_until > self._pause_until:
                     self._pause_until = pause_until
                 log.warning(
                     "rate_limit_cooldown",
-                    consecutive=self._consecutive_rate_limits,
-                    sleep_sec=cooldown,
+                    cooldown_sec=cooldown,
+                    retry_after_from_server=outcome.retry_after_sec,
+                    next_base_sleep=self._current_base,
                 )
             return
         async with self._lock:
-            self._consecutive_rate_limits = 0
-        if self.base_sleep_sec > 0:
-            await asyncio.sleep(self.base_sleep_sec)
+            self._consecutive_successes += 1
+            # AIMD: multiplicative decrease after a streak. The ÷1.5 lets the
+            # controller probe for a faster steady state while still backing
+            # off quickly when the server pushes back.
+            if self._consecutive_successes >= 3 and self._current_base > self.base_min:
+                self._current_base = max(self.base_min, self._current_base / 1.5)
+                self._consecutive_successes = 0
+                log.info("pacer_decreased", next_base_sleep=self._current_base)
+            sleep_for = self._current_base
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)

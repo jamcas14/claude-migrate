@@ -308,51 +308,31 @@ class _FakeStreamSession:
         return None
 
 
-async def test_stream_retries_429_with_backoff_then_succeeds(
+async def test_stream_429_raises_immediately_no_inner_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """stream() must follow the same retry policy as request() for 429
-    handshake responses — used to silently fail on first 429."""
-    import claude_migrate.client as cm
+    """stream() raises RateLimited on the FIRST 429 without inner retry.
 
-    sleeps: list[float] = []
-
-    async def fake_sleep(t: float) -> None:
-        sleeps.append(t)
-
-    monkeypatch.setattr(cm.asyncio, "sleep", fake_sleep)
-    c = _client()
-    c._session = _FakeStreamSession(
-        _FakeStreamResp(429),
-        _FakeStreamResp(429),
-        _FakeStreamResp(200),  # eventual success
-    )
-    lines: list[str] = []
-    async for ln in c.stream("POST", "/api/x"):
-        lines.append(ln)
-    # Two retries before success → two backoff sleeps.
-    assert len(sleeps) == 2
-    assert all(2 <= t < 61 for t in sleeps), f"unexpected sleep durations: {sleeps}"
-    assert lines == ['data: {"stop_reason": "end_turn"}']
-
-
-async def test_stream_429_after_max_retries_raises_rate_limited(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """After MAX_RETRIES (3) consecutive 429s, raise RateLimited."""
+    The conversation-restore loop already retries via its outer Pacer with
+    a proper cooldown. Inner retry here just burned ~14s of wasted sleep
+    before the real cooldown — actively slowing the migration on every
+    rate-limited chat. The fix dropped the inner retry on 429 (kept for 5xx).
+    """
     import claude_migrate.client as cm
     from claude_migrate.errors import RateLimited
 
-    async def fake_sleep(t: float) -> None: ...
+    sleeps: list[float] = []
+    async def fake_sleep(t: float) -> None: sleeps.append(t)
     monkeypatch.setattr(cm.asyncio, "sleep", fake_sleep)
     c = _client()
-    c._session = _FakeStreamSession(
-        _FakeStreamResp(429), _FakeStreamResp(429),
-        _FakeStreamResp(429), _FakeStreamResp(429),
-    )
+    c._session = _FakeStreamSession(_FakeStreamResp(429))
     with pytest.raises(RateLimited):
         async for _ in c.stream("POST", "/api/x"):
             pass
+    # No inner retry, so no sleep before the raise.
+    assert sleeps == []
+    # The session.stream call fired exactly once.
+    assert c._session.stream_call_count == 1
 
 
 async def test_stream_5xx_retries(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -421,11 +401,13 @@ async def test_stream_holds_semaphore_for_duration(
             pass
 
 
-async def test_stream_releases_sem_during_retry_sleep(
+async def test_stream_releases_sem_during_5xx_retry_sleep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mirroring request(): retry-backoff sleep must NOT hold the semaphore.
-    Otherwise one rate-limited stream freezes 1/N of the cap for up to 60s."""
+    """Mirroring request(): the 5xx retry-backoff sleep must NOT hold the
+    semaphore. Otherwise one transient 503 freezes 1/N of the cap for up
+    to 60s. (429 no longer retries inside stream — that's the conversation
+    worker's outer-Pacer responsibility.)"""
     import claude_migrate.client as cm
 
     sem_levels: list[int] = []
@@ -438,7 +420,7 @@ async def test_stream_releases_sem_during_retry_sleep(
     c = _client()
     initial = c._sem._value
     c._session = _FakeStreamSession(
-        _FakeStreamResp(429), _FakeStreamResp(200),
+        _FakeStreamResp(503), _FakeStreamResp(200),
     )
     async for _ in c.stream("POST", "/api/x"):
         pass
@@ -446,6 +428,85 @@ async def test_stream_releases_sem_during_retry_sleep(
     assert sem_levels == [initial], (
         f"_sem was held during retry sleep (saw level {sem_levels})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Retry-After header parsing.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_retry_after_integer_seconds() -> None:
+    from claude_migrate.client import _parse_retry_after
+    assert _parse_retry_after("120") == 120.0
+
+
+def test_parse_retry_after_clamps_too_large() -> None:
+    """Misconfigured edge sending Retry-After: 86400 must not wedge the run."""
+    from claude_migrate.client import _RETRY_AFTER_MAX, _parse_retry_after
+    assert _parse_retry_after("86400") == _RETRY_AFTER_MAX
+
+
+def test_parse_retry_after_clamps_too_small() -> None:
+    """Server replying 0 or 1 should still floor to a sane minimum."""
+    from claude_migrate.client import _RETRY_AFTER_MIN, _parse_retry_after
+    assert _parse_retry_after("0") == _RETRY_AFTER_MIN
+    assert _parse_retry_after("1") == _RETRY_AFTER_MIN
+
+
+def test_parse_retry_after_http_date() -> None:
+    """Form 2 of RFC 7231 — HTTP-date in the future."""
+    # Use a date ~5 minutes in the future. The exact seconds will vary by
+    # clock skew but should be in the 100-600s clamp.
+    import email.utils
+    from datetime import UTC, datetime, timedelta
+
+    from claude_migrate.client import _parse_retry_after
+    future = datetime.now(UTC) + timedelta(minutes=5)
+    header = email.utils.format_datetime(future)
+    parsed = _parse_retry_after(header)
+    assert parsed is not None
+    assert 100 <= parsed <= 600
+
+
+def test_parse_retry_after_garbage() -> None:
+    from claude_migrate.client import _parse_retry_after
+    assert _parse_retry_after(None) is None
+    assert _parse_retry_after("") is None
+    assert _parse_retry_after("not-a-thing") is None
+
+
+async def test_429_carries_retry_after_to_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 response with Retry-After populates RateLimited.retry_after_sec
+    so the orchestrator's Pacer can use it as the cooldown floor."""
+    import claude_migrate.client as cm
+    from claude_migrate.errors import RateLimited
+
+    async def fake_sleep(t: float) -> None: ...
+    monkeypatch.setattr(cm.asyncio, "sleep", fake_sleep)
+
+    class _RespWithHeaders:
+        def __init__(self, status: int, retry_after: str) -> None:
+            self.status_code = status
+            self.content = b""
+            self.headers = {"Retry-After": retry_after}
+
+    class _SessWithHeaders:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def request(self, method: Any, url: Any, **kw: Any) -> Any:
+            self.calls += 1
+            return _RespWithHeaders(429, "45")
+
+        async def close(self) -> None: ...
+
+    c = _client()
+    c._session = _SessWithHeaders()
+    with pytest.raises(RateLimited) as exc_info:
+        await c.get_json("/api/x")
+    assert exc_info.value.retry_after_sec == 45.0
 
 
 async def test_session_init_is_lock_protected_under_concurrency(

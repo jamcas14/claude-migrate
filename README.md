@@ -30,6 +30,23 @@ claude-migrate --help
 
 Requires Python 3.12+. macOS, Linux, and Windows are supported.
 
+### Tab-completion of profile names
+
+Add this once to your shell rc to get `<Tab>` completion on stored profile names everywhere `claude-migrate` takes a profile argument:
+
+```bash
+# bash — add to ~/.bashrc
+eval "$(_CLAUDE_MIGRATE_COMPLETE=bash_source claude-migrate)"
+
+# zsh — add to ~/.zshrc
+eval "$(_CLAUDE_MIGRATE_COMPLETE=zsh_source claude-migrate)"
+
+# fish — write once, no eval needed
+_CLAUDE_MIGRATE_COMPLETE=fish_source claude-migrate > ~/.config/fish/completions/claude-migrate.fish
+```
+
+After re-sourcing your rc, `claude-migrate whoami so<Tab>` expands to `source` (etc).
+
 ---
 
 ## What gets migrated
@@ -147,6 +164,57 @@ claude-migrate memory --open
 # 6. (Optional) Daily incremental backup of source.
 claude-migrate schedule install
 ```
+
+---
+
+## Tuning the migration speed
+
+For all but the smallest accounts, `claude-migrate migrate source target` is **rate-limited by Anthropic's account-side usage bucket**, not by anything in this tool. This section explains what that means and how to work with it.
+
+### The hard wall — how Anthropic rate-limits /completion
+
+Anthropic caps `/completion` calls (the only endpoint that can write a message) on a 5-hour rolling token bucket per account:
+
+| Plan | ≈ messages per 5-hour window |
+|---|---:|
+| Free | ~15–40 |
+| Pro ($20/mo) | ~45 |
+| Max 5x ($100/mo) | ~225 |
+| Max 20x ($200/mo) | ~900 |
+
+So **a 200-chat migration on Pro takes ≥22 hours of wall-clock**, split across ≥5 windows, no matter how clever the client. The community-converged numbers above can change without notice (Anthropic doesn't publish exact figures).
+
+Two further wrinkles:
+
+- **Peak hours (Mon–Fri 13:00–19:00 UTC) drain the bucket ~2× faster.** Running on a Saturday morning UTC is a free ~2× speedup. The migrate command will warn you if you start during peak.
+- The bucket is per-account, not per-IP. VPN won't help.
+
+### Speedup options, ranked by impact
+
+1. **Upgrade to Max 5x for one month ($100).** A 200-chat run finishes in one 5-hour window. Highest leverage for full-fidelity migration.
+2. **`--archive-only`.** Skips `/completion` entirely. Bundles every conversation as a markdown doc inside one Project on target. **200 chats finishes in minutes.** Trade-off: chats live in one Project (searchable as project knowledge, ask it questions), not as individual entries in Recents.
+   ```bash
+   claude-migrate migrate source target --archive-only
+   ```
+3. **`--fast` flag.** Shortcut for `--concurrency=3`. On accounts with slack in the bucket, runs three conversations in parallel. Auto-reorder runs at the end so Recents matches source `updated_at` ordering.
+   ```bash
+   claude-migrate migrate source target --fast
+   ```
+4. **Run on a weekend morning UTC.** Off-peak ~2× speedup.
+5. **Tune `chat_sleep_sec`.** Default 30s. The Pacer adapts within `[5s, chat_sleep_sec]` based on observed 429s. Lower if your account doesn't 429; raise if it always does. Override via `CLAUDE_MIGRATE_CHAT_SLEEP_SEC=60`.
+
+### What the tool already does for you
+
+- **Adaptive pacing (AIMD)**: starts at 5s/chat, doubles on 429, divides by 1.5 after 3 consecutive successes. Adapts to your account's actual rate, not a fixed conservative default.
+- **Honors server-side `Retry-After`**: when claude.ai sends a header telling us how long to wait, we wait that long instead of a hardcoded 300s cooldown.
+- **Drops wasted client-side retries on 429**: the conversation-restore loop's outer cooldown is the right place to retry; inner retries inside the SSE handshake just burn ~14s of extra sleep.
+- **Empirical instrumentation**: each 429 is logged with the response headers so you can verify what the server is sending. If `retry_after_header` shows a value, the Pacer respects it.
+
+### What `--archive-only` looks like on target
+
+After running it, the target account has one new project named `[archive] {source-email} {YYYY-MM-DD}`. Inside, every source conversation is a `.md` file with the full transcript. Open the project and ask "what did I discuss about X?" — Claude searches the docs.
+
+This is **functionally equivalent to a backup-and-search use case** for many users. If you don't actually need each chat as its own entry in Recents (most don't, especially for chats older than a few weeks), `--archive-only` is the right choice.
 
 ---
 

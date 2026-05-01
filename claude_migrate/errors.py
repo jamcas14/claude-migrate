@@ -64,9 +64,20 @@ class ClientVersionStale(ClaudeMigrateError):
 
 
 class RateLimited(ClaudeMigrateError):
-    """429 after exhausted backoff."""
+    """429 after exhausted backoff.
+
+    `retry_after_sec` carries the server's `Retry-After` hint when present,
+    so the orchestrator's Pacer can use it as the cooldown floor instead of
+    a fixed schedule. Anthropic's documented API surface always sends this
+    header on 429; the consumer claude.ai surface is undocumented but uses
+    the same backend stack — capture it opportunistically.
+    """
 
     code = "rate_limited"
+
+    def __init__(self, message: str, *, retry_after_sec: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_sec = retry_after_sec
 
 
 class SchemaDrift(ClaudeMigrateError):

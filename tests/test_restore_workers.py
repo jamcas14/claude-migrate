@@ -69,6 +69,48 @@ async def test_restore_profile_prefs_swallows_recoverable_errors(
     assert result is False  # logged + skipped, no raise
 
 
+async def test_restore_profile_prefs_filters_internal_settings_keys(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """The user's log shows claude.ai 400s on `internal_*` keys nested inside
+    `settings`. Top-level filter wouldn't catch them. Per-PUT body must have
+    those nested keys removed."""
+    upsert_org(db_conn, {"uuid": "o1", "name": "Test"})
+    upsert_account(db_conn, "o1", {
+        "full_name": "User",
+        "settings": {
+            "theme": "dark",
+            "internal_melange_store_id": "abc",
+            "internal_tier_org_type": "pro",
+            "preferred_model": "claude-sonnet-4-6",
+        },
+    })
+
+    captured: dict[str, object] = {}
+
+    async def fake_put(path: str, *, body: dict[str, object], **kw: object) -> dict[str, object]:
+        captured["body"] = body
+        return {"ok": True}
+
+    client = MagicMock()
+    client.put_json = AsyncMock(side_effect=fake_put)
+
+    result = await restore_profile_prefs(client, db_conn, dry_run=False)
+    assert result is True
+    body = captured["body"]
+    assert isinstance(body, dict)
+    settings = body.get("settings")
+    assert isinstance(settings, dict)
+    # Allowed keys passed through.
+    assert "theme" in settings
+    assert "preferred_model" in settings
+    # Internal keys filtered out.
+    for k in settings:
+        assert not k.startswith("internal_"), (
+            f"internal key {k!r} must be filtered out of settings"
+        )
+
+
 # ---------------------------------------------------------------------------
 # reorder_conversations — RateLimited handling
 # ---------------------------------------------------------------------------

@@ -76,6 +76,16 @@ async def restore_profile_prefs(
         return True
     raw = json.loads(row["raw"]) if row["raw"] else {}
     settable = {k: v for k, v in raw.items() if k in {"full_name", "settings", "name", "role"}}
+    # Filter `internal_*` keys out of the `settings` sub-dict — claude.ai
+    # rejects PUT requests that try to update them ("Cannot update internal
+    # settings: internal_melange_store_id, internal_tier_*, ..."). The
+    # top-level filter above never saw these because they live nested inside
+    # the `settings` blob. Without this filter, prefs sync 400s every run.
+    if isinstance(settable.get("settings"), dict):
+        settable["settings"] = {
+            k: v for k, v in settable["settings"].items()
+            if not k.startswith("internal_")
+        }
     if not settable:
         return False
     try:
@@ -126,7 +136,10 @@ async def restore_styles(
                     f"/api/organizations/{target_org}/custom_styles", body=body
                 )
             except RateLimited as e:
-                return WorkerOutcome.failed(f"style: {e}", rate_limited=True)
+                return WorkerOutcome.failed(
+                    f"style: {e}", rate_limited=True,
+                    retry_after_sec=e.retry_after_sec,
+                )
             except (ClientVersionStale, EndpointChanged, NetworkError) as e:
                 # ClientVersionStale = headers stale; per-row failure, run continues.
                 return WorkerOutcome.failed(f"style: {e}")
@@ -208,7 +221,10 @@ async def restore_projects(
                         )
                     return WorkerOutcome.ok(new_uuid)
                 except RateLimited as e:
-                    return WorkerOutcome.failed(f"project: {e}", rate_limited=True)
+                    return WorkerOutcome.failed(
+                        f"project: {e}", rate_limited=True,
+                        retry_after_sec=e.retry_after_sec,
+                    )
                 except (
                     ClientVersionStale, EndpointChanged, NetworkError, SchemaDrift,
                 ) as e:
@@ -405,7 +421,9 @@ async def reorder_conversations(
             await pacer.after(WorkerOutcome.ok(target_uuid))
         except RateLimited as e:
             errors.append((source_uuid, f"reorder: {e}"))
-            await pacer.after(WorkerOutcome.failed(str(e), rate_limited=True))
+            await pacer.after(WorkerOutcome.failed(
+                str(e), rate_limited=True, retry_after_sec=e.retry_after_sec,
+            ))
         except (EndpointChanged, NetworkError, ClientVersionStale) as e:
             errors.append((source_uuid, f"reorder: {e}"))
             await pacer.after(WorkerOutcome.failed(str(e)))
@@ -430,7 +448,9 @@ async def delete_conversation(
         return WorkerOutcome.ok(conv_uuid)
     except RateLimited as e:
         log.warning("orphan_delete_rate_limited", uuid=conv_uuid, err=str(e))
-        return WorkerOutcome.failed(str(e), rate_limited=True)
+        return WorkerOutcome.failed(
+            str(e), rate_limited=True, retry_after_sec=e.retry_after_sec,
+        )
     except ClaudeMigrateError as e:
         log.warning(
             "orphan_delete_failed",
@@ -492,7 +512,10 @@ async def restore_conversation(
         return WorkerOutcome.ok(new_uuid)
     except RateLimited as e:
         await _cleanup_partial(client, target_org, new_uuid)
-        return WorkerOutcome.failed(f"{type(e).__name__}: {e}", rate_limited=True)
+        return WorkerOutcome.failed(
+            f"{type(e).__name__}: {e}", rate_limited=True,
+            retry_after_sec=e.retry_after_sec,
+        )
     except NetworkError as e:
         await _cleanup_partial(client, target_org, new_uuid)
         return WorkerOutcome.failed(f"{type(e).__name__}: {e}")
@@ -585,7 +608,11 @@ async def restore_all_conversations(
         rate_limit_sleep_sec=RESTORE_CHAT_RATE_LIMIT_SLEEP_SEC,
     )
     total = len(rows)
-    max_attempts = 3  # allow two retries past the first rate-limited failure
+    # 2 attempts: one initial + one retry. After AIMD adapts and the Pacer
+    # cools down on a 429, the third attempt was mostly a tax on outlier
+    # chats — cuts the worst-case wall clock for a rate-limited chat from
+    # ~12min (3 attempts x 1 cooldown each) to ~6min.
+    max_attempts = 2
 
     async def one(idx: int, row: sqlite3.Row) -> None:
         source_uuid = row["uuid"]
