@@ -163,3 +163,115 @@ def test_launchd_install_xml_escapes_special_chars(
     # the plist is malformed.
     assert "&amp;amp" in plist
     assert "<string>/path/with&amp;amp</string>" in plist
+
+
+def test_launchd_install_xml_escapes_log_paths(
+    tmp_path: Path, monkeypatch: object,
+) -> None:
+    """StandardOutPath / StandardErrorPath must XML-escape too — a custom
+    data dir with `&` or `<` would otherwise produce an unloadable plist."""
+    weird = tmp_path / "data&dir"
+    monkeypatch.setenv("HOME", str(tmp_path))  # type: ignore[attr-defined]
+    monkeypatch.setenv("CLAUDE_MIGRATE_DATA_DIR", str(weird))  # type: ignore[attr-defined]
+    with _stub_subprocess():
+        scheduler._launchd_install("normal-name")
+    plist = scheduler._launchd_plist_path().read_text()
+    # Raw `&` in the log path must be encoded.
+    assert "data&dir" not in plist
+    assert "data&amp;dir" in plist
+
+
+def test_systemd_install_propagates_data_dir_env(
+    tmp_path: Path, monkeypatch: object,
+) -> None:
+    """A custom CLAUDE_MIGRATE_DATA_DIR must reach the daily timer, otherwise
+    the scheduled backup writes to the default path while interactive runs
+    use the override — silent split-brain."""
+    custom = tmp_path / "custom-data"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))  # type: ignore[attr-defined]
+    monkeypatch.setenv("CLAUDE_MIGRATE_DATA_DIR", str(custom))  # type: ignore[attr-defined]
+    with _stub_subprocess():
+        scheduler._systemd_install("work")
+    service = (
+        tmp_path / "config" / "systemd" / "user" / "claude-migrate.service"
+    ).read_text()
+    assert f"Environment=CLAUDE_MIGRATE_DATA_DIR={custom}" in service or (
+        f'Environment=CLAUDE_MIGRATE_DATA_DIR="{custom}"' in service
+    )
+
+
+def test_systemd_install_omits_env_when_unset(
+    tmp_path: Path, monkeypatch: object,
+) -> None:
+    """No CLAUDE_MIGRATE_DATA_DIR set → no Environment= line in unit."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))  # type: ignore[attr-defined]
+    monkeypatch.delenv("CLAUDE_MIGRATE_DATA_DIR", raising=False)  # type: ignore[attr-defined]
+    with _stub_subprocess():
+        scheduler._systemd_install("work")
+    service = (
+        tmp_path / "config" / "systemd" / "user" / "claude-migrate.service"
+    ).read_text()
+    assert "Environment=CLAUDE_MIGRATE_DATA_DIR" not in service
+
+
+def test_launchd_install_propagates_data_dir_env(
+    tmp_path: Path, monkeypatch: object,
+) -> None:
+    custom = tmp_path / "custom-data"
+    monkeypatch.setenv("HOME", str(tmp_path))  # type: ignore[attr-defined]
+    monkeypatch.setenv("CLAUDE_MIGRATE_DATA_DIR", str(custom))  # type: ignore[attr-defined]
+    with _stub_subprocess():
+        scheduler._launchd_install("work")
+    plist = scheduler._launchd_plist_path().read_text()
+    assert "<key>EnvironmentVariables</key>" in plist
+    assert "<key>CLAUDE_MIGRATE_DATA_DIR</key>" in plist
+    assert str(custom) in plist
+
+
+def test_cron_install_propagates_data_dir_env(
+    tmp_path: Path, monkeypatch: object,
+) -> None:
+    custom = tmp_path / "custom-data"
+    monkeypatch.setenv("CLAUDE_MIGRATE_DATA_DIR", str(custom))  # type: ignore[attr-defined]
+    captured: dict[str, str] = {"input": ""}
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+
+    def fake_run(cmd: list[str], **kwargs: object) -> _Result:
+        if cmd == ["crontab", "-"]:
+            captured["input"] = str(kwargs.get("input", ""))
+        return _Result()
+
+    with patch("claude_migrate.scheduler.subprocess.run", side_effect=fake_run):
+        scheduler._cron_install("work")
+    assert "CLAUDE_MIGRATE_DATA_DIR=" in captured["input"]
+    assert str(custom) in captured["input"]
+
+
+def test_task_scheduler_install_propagates_data_dir_env(
+    tmp_path: Path, monkeypatch: object,
+) -> None:
+    """schtasks doesn't have a native env-passthrough, so we wrap in
+    cmd.exe /c "set VAR=val && exe args" to give the daily run the same
+    env as interactive."""
+    custom = tmp_path / "custom-data"
+    monkeypatch.setenv("CLAUDE_MIGRATE_DATA_DIR", str(custom))  # type: ignore[attr-defined]
+    captured: dict[str, list[str]] = {"args": []}
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd: list[str], *args: object, **kwargs: object) -> _Result:
+        captured["args"] = list(cmd)
+        return _Result()
+
+    with patch("claude_migrate.scheduler.subprocess.run", side_effect=fake_run):
+        scheduler._task_scheduler_install("work")
+    cmd = captured["args"]
+    tr_value = cmd[cmd.index("/TR") + 1]
+    assert "set CLAUDE_MIGRATE_DATA_DIR=" in tr_value
+    assert "cmd.exe /c" in tr_value

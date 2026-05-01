@@ -202,20 +202,36 @@ async def test_cleanup_partial_no_op_when_no_uuid() -> None:
 
 
 @pytest.mark.parametrize(
-    "exc",
+    ("exc", "expect_rate_limited"),
     [
-        RateLimited("429"),
-        ClientVersionStale("stale"),
-        AuthExpired("session ended"),
+        (RateLimited("429"), True),
+        (ClientVersionStale("stale"), False),
+        (AuthExpired("session ended"), False),
+        (CloudflareChallenge("blocked"), False),
+        (TLSReject("fingerprint"), False),
     ],
 )
-async def test_delete_conversation_returns_false_on_typed_errors(exc: Exception) -> None:
-    """cleanup CLI's per-orphan loop relies on the boolean return; it must
-    NOT propagate the exception (would abort the whole sweep)."""
+async def test_delete_conversation_returns_outcome_on_typed_errors(
+    exc: Exception, expect_rate_limited: bool,
+) -> None:
+    """cleanup CLI's per-orphan loop relies on the WorkerOutcome shape; the
+    rate_limited flag drives Pacer cooldown so sustained 429s actually
+    back off instead of burning through every orphan."""
     client = MagicMock()
     client.request = AsyncMock(side_effect=exc)
-    ok = await delete_conversation(client, "tgt-org", "uuid")
-    assert ok is False
+    outcome = await delete_conversation(client, "tgt-org", "uuid")
+    assert outcome.target_uuid is None
+    assert outcome.rate_limited is expect_rate_limited
+    assert outcome.error is not None
+
+
+async def test_delete_conversation_returns_ok_on_success() -> None:
+    client = MagicMock()
+    client.request = AsyncMock(return_value=None)
+    outcome = await delete_conversation(client, "tgt-org", "uuid-X")
+    assert outcome.target_uuid == "uuid-X"
+    assert outcome.error is None
+    assert outcome.rate_limited is False
 
 
 # ---------------------------------------------------------------------------

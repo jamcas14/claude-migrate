@@ -276,7 +276,11 @@ def remove(name: str) -> None:
     """Local-only — deletes the cookie blob from your keychain. Does NOT
     invalidate the cookie on Anthropic's side; the original browser session
     keeps working."""
-    remove_profile(name)
+    try:
+        remove_profile(name)
+    except AuthMissing as e:
+        click.echo(f"\n{e}", err=True)
+        sys.exit(2)
     click.echo(f"Removed profile {name!r}.")
 
 
@@ -314,7 +318,14 @@ def rename(old_name: str, new_name: str) -> None:
     if old_name == new_name:
         click.echo(f"Source and destination are both {old_name!r}; nothing to do.")
         return
-    profile = load_profile(old_name)  # raises AuthMissing if not found
+    try:
+        profile = load_profile(old_name)
+    except AuthMissing as e:
+        click.echo(f"\n{e}", err=True)
+        sys.exit(2)
+    except AuthInvalid as e:
+        click.echo(f"\n{e}", err=True)
+        sys.exit(2)
     if _profile_exists(new_name):
         click.echo(
             f"A profile named {new_name!r} already exists. Run "
@@ -817,11 +828,12 @@ def cleanup(
         return
 
     async def delete() -> None:
-        # Pace deletes: a tight DELETE loop hits the same rate-limit
-        # window /completion does. 0.5s between calls + a Pacer that
-        # respects 429 cooldowns lets cleanup of large orphan sets finish
-        # without abandoning halfway through.
-        from .runner import Pacer, WorkerOutcome
+        # Pace deletes: a tight DELETE loop hits the same rate-limit window
+        # /completion does. delete_conversation returns a WorkerOutcome with
+        # rate_limited=True on 429, which Pacer.after uses to extend the
+        # cooldown — without that signal, sustained 429s would burn through
+        # every orphan with no backoff.
+        from .runner import Pacer
         pacer = Pacer(base_sleep_sec=0.5, rate_limit_sleep_sec=60.0)
         async with open_session(target) as session:
             deleted = 0
@@ -830,15 +842,10 @@ def cleanup(
                 if not isinstance(cu, str):
                     continue
                 await pacer.before()
-                ok = await delete_conversation(session.client, session.org_uuid, cu)
-                if ok:
+                outcome = await delete_conversation(session.client, session.org_uuid, cu)
+                if outcome.target_uuid:
                     deleted += 1
-                    await pacer.after(WorkerOutcome.ok(cu))
-                else:
-                    # delete_conversation only fails for EndpointChanged or
-                    # NetworkError — both already logged. Treat as ordinary
-                    # outcome (no rate-limited flag without explicit signal).
-                    await pacer.after(WorkerOutcome.failed("delete failed"))
+                await pacer.after(outcome)
             click.echo(f"  deleted {deleted}/{len(orphans)} orphans")
 
     _run(delete())

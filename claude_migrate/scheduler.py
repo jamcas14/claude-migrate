@@ -93,6 +93,16 @@ def _systemd_install(profile: str) -> TimerStatus:
     exec_start = _shell_quote_for_systemd(argv)
     log_dir = data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    # Propagate CLAUDE_MIGRATE_DATA_DIR if the user set it at install time —
+    # otherwise the daily timer writes to the default ~/.local/share path
+    # while interactive runs use the configured override (split-brain).
+    env_lines = ""
+    data_dir_env = os.environ.get("CLAUDE_MIGRATE_DATA_DIR")
+    if data_dir_env:
+        env_lines = (
+            f"Environment=CLAUDE_MIGRATE_DATA_DIR="
+            f"{_shell_quote_for_systemd([data_dir_env])}\n"
+        )
     service = (
         "[Unit]\n"
         f"Description=Daily incremental backup of profile {profile!r}\n"
@@ -102,6 +112,7 @@ def _systemd_install(profile: str) -> TimerStatus:
         "Type=oneshot\n"
         f"ExecStart={exec_start}\n"
         f"WorkingDirectory={data_dir().parent}\n"
+        f"{env_lines}"
         f"StandardOutput=append:{log_dir}/backup.log\n"
         f"StandardError=append:{log_dir}/backup.log\n"
     )
@@ -157,25 +168,36 @@ def _launchd_install(profile: str) -> TimerStatus:
     log_dir = data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     args = [*_claude_migrate_argv(), "--quiet", "backup", profile]
-    # Each <string> wraps one argv token; XML-escape so a path with `&`/`<`/`>`
-    # doesn't break the plist parser.
+    # Every text node we interpolate must be XML-escaped — argv, log paths,
+    # and env values alike. Otherwise a path containing `&`/`<`/`>`/quotes
+    # leaves the plist malformed and `launchctl load` fails silently.
     extra = {'"': "&quot;", "'": "&apos;"}
-    program_args = "".join(
-        f"<string>{xml_escape(a, extra)}</string>" for a in args
-    )
+    def xe(s: str) -> str:
+        return xml_escape(s, extra)
+    program_args = "".join(f"<string>{xe(a)}</string>" for a in args)
+    log_path = xe(f"{log_dir}/backup.log")
+    env_block = ""
+    data_dir_env = os.environ.get("CLAUDE_MIGRATE_DATA_DIR")
+    if data_dir_env:
+        env_block = (
+            "  <key>EnvironmentVariables</key>\n"
+            f"  <dict><key>CLAUDE_MIGRATE_DATA_DIR</key>"
+            f"<string>{xe(data_dir_env)}</string></dict>\n"
+        )
     plist = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
         '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
         '<plist version="1.0">\n<dict>\n'
-        f'  <key>Label</key><string>{LAUNCHD_LABEL}</string>\n'
+        f'  <key>Label</key><string>{xe(LAUNCHD_LABEL)}</string>\n'
         '  <key>ProgramArguments</key>\n'
         f'  <array>{program_args}</array>\n'
         '  <key>StartCalendarInterval</key>\n'
         '  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>17</integer></dict>\n'
-        f'  <key>StandardOutPath</key><string>{log_dir}/backup.log</string>\n'
-        f'  <key>StandardErrorPath</key><string>{log_dir}/backup.log</string>\n'
+        f'  <key>StandardOutPath</key><string>{log_path}</string>\n'
+        f'  <key>StandardErrorPath</key><string>{log_path}</string>\n'
         '  <key>RunAtLoad</key><false/>\n'
+        f'{env_block}'
         '</dict>\n</plist>\n'
     )
     p.write_text(plist, "utf-8")
@@ -203,6 +225,18 @@ def _task_scheduler_install(profile: str) -> TimerStatus:
     # the /TR argument. We use subprocess.list2cmdline to escape paths/spaces.
     argv = [*_claude_migrate_argv(), "--quiet", "backup", profile]
     tr_value = subprocess.list2cmdline(argv)
+    # Propagate CLAUDE_MIGRATE_DATA_DIR by wrapping the call in cmd.exe so
+    # the SET runs in the same shell as the invocation. Without this, a
+    # user with a custom data dir would see the daily timer write to a
+    # different location than their interactive runs.
+    data_dir_env = os.environ.get("CLAUDE_MIGRATE_DATA_DIR")
+    if data_dir_env:
+        # Quote the SET value via list2cmdline-equivalent: schtasks evaluates
+        # /TR with cmd.exe, so we follow cmd's escape rules.
+        set_value = subprocess.list2cmdline([data_dir_env])
+        tr_value = (
+            f'cmd.exe /c "set CLAUDE_MIGRATE_DATA_DIR={set_value} && {tr_value}"'
+        )
     cmd = [
         "schtasks", "/Create", "/SC", "DAILY", "/TN", "claude-migrate",
         "/TR", tr_value, "/ST", "04:17", "/F",
@@ -286,7 +320,14 @@ CRON_TAG = "# claude-migrate (managed)"
 def _cron_install(profile: str) -> TimerStatus:
     argv = [*_claude_migrate_argv(), "--quiet", "backup", profile]
     cmd = _shell_quote_for_cron(argv)
-    line = f"17 4 * * * {cmd}  {CRON_TAG}\n"
+    # Inline env for the timer so a custom CLAUDE_MIGRATE_DATA_DIR matches
+    # what the user runs interactively. cron evaluates the line with sh, so
+    # `VAR=value cmd` works.
+    env_prefix = ""
+    data_dir_env = os.environ.get("CLAUDE_MIGRATE_DATA_DIR")
+    if data_dir_env:
+        env_prefix = f"CLAUDE_MIGRATE_DATA_DIR={_shell_quote_for_cron([data_dir_env])} "
+    line = f"17 4 * * * {env_prefix}{cmd}  {CRON_TAG}\n"
     existing = subprocess.run(
         ["crontab", "-l"], capture_output=True, text=True, check=False
     ).stdout

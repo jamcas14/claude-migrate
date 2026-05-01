@@ -127,6 +127,48 @@ def test_parse_window_naive_input_assumes_utc() -> None:
     assert dt.utcoffset().total_seconds() == 0
 
 
+# ---------------------------------------------------------------------------
+# Friendly errors for synchronous commands (don't traceback on missing profile).
+# ---------------------------------------------------------------------------
+
+
+def test_remove_missing_profile_emits_friendly_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`remove` runs synchronously without _run; AuthMissing must NOT
+    propagate as a traceback."""
+    from claude_migrate.errors import AuthMissing
+
+    def fake_remove(name: str) -> None:
+        raise AuthMissing(f"No profile named {name!r} to remove.")
+
+    monkeypatch.setattr(cli_mod, "remove_profile", fake_remove)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["remove", "ghost", "--yes"])
+    assert result.exit_code == 2
+    assert "No profile named 'ghost' to remove" in result.output
+    # No Python traceback — just the friendly error.
+    assert "Traceback" not in result.output
+
+
+def test_rename_missing_source_emits_friendly_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`rename old new` with nonexistent old should print a friendly error,
+    not traceback from load_profile."""
+    from claude_migrate.errors import AuthMissing
+
+    def fake_load(name: str) -> object:
+        raise AuthMissing(f"No profile named {name!r} found. Run `claude-migrate add {name}` first.")
+
+    monkeypatch.setattr(cli_mod, "load_profile", fake_load)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["rename", "ghost", "newname"])
+    assert result.exit_code == 2
+    assert "No profile named 'ghost'" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_cleanup_garbage_arg_exits_two() -> None:
     """The CLI command translates parse failures into exit code 2 with a hint."""
     runner = CliRunner()

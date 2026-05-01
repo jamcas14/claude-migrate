@@ -414,24 +414,29 @@ async def reorder_conversations(
 
 async def delete_conversation(
     client: ClaudeClient, target_org: str, conv_uuid: str
-) -> bool:
-    """Best-effort DELETE. Catches the full `ClaudeMigrateError` family so a
-    429/422 on one orphan during `cleanup` doesn't abort the whole loop —
-    the Pacer at the call site uses our return value to decide whether to
-    back off."""
+) -> WorkerOutcome:
+    """Best-effort DELETE. Returns a `WorkerOutcome` so the cleanup call site
+    can feed the right signal to its `Pacer` — in particular, a 429 here
+    must surface as `rate_limited=True` so the cooldown actually fires.
+    Without this, a sustained 429 on cleanup retries through every orphan
+    without backing off, racking up failures.
+    """
     try:
         await client.request(
             "DELETE",
             f"/api/organizations/{target_org}/chat_conversations/{conv_uuid}",
             expect_json=False,
         )
-        return True
+        return WorkerOutcome.ok(conv_uuid)
+    except RateLimited as e:
+        log.warning("orphan_delete_rate_limited", uuid=conv_uuid, err=str(e))
+        return WorkerOutcome.failed(str(e), rate_limited=True)
     except ClaudeMigrateError as e:
         log.warning(
             "orphan_delete_failed",
             uuid=conv_uuid, err=str(e), err_type=type(e).__name__,
         )
-        return False
+        return WorkerOutcome.failed(str(e))
 
 
 # ---------------------------------------------------------------------------
