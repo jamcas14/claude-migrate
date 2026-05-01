@@ -95,8 +95,10 @@ async def send_payload(
                 )
         case _:
             raise SchemaDrift(
-                f"transport.send_payload received unsupported payload type "
-                f"{type(payload).__name__}; update the match arms in transport.py"
+                f"send_payload doesn't know how to handle payload type "
+                f"{type(payload).__name__}. This is an internal bug — open an "
+                "issue with the command you ran and the type name above: "
+                "https://github.com/jamcas14/claude-migrate/issues"
             )
 
 
@@ -155,7 +157,11 @@ async def _await_completion(
             saw_stop = True
             break
     if not saw_stop:
-        raise NetworkError("completion stream ended without a stop signal")
+        raise NetworkError(
+            "claude.ai's /completion stream closed before sending a stop signal "
+            "(no `stop_reason`, no `message_stop`, no `[DONE]`). Usually "
+            "transient — re-running the migration retries the affected chat."
+        )
 
 
 async def _upload_attachment(
@@ -202,12 +208,19 @@ async def _upload_attachment(
         # 200 status code; surface as SchemaDrift rather than crashing on
         # an uncaught JSONDecodeError.
         raise SchemaDrift(
-            f"upload returned 200 but body is not JSON: "
-            f"{resp.content[:200]!r}"
+            f"claude.ai's /upload returned HTTP 200 but the body wasn't JSON. "
+            "This is occasionally a Cloudflare interstitial leaking through. "
+            f"First 200 bytes: {resp.content[:200]!r}"
         ) from e
     if not isinstance(j, dict):
-        raise SchemaDrift(f"upload returned 200 with non-dict body: {type(j).__name__}")
+        raise SchemaDrift(
+            f"claude.ai's /upload returned 200 but the JSON body was a "
+            f"{type(j).__name__} (expected an object). Schema drift on Anthropic's side."
+        )
     fu = j.get("file_uuid") or j.get("uuid")
     if not isinstance(fu, str):
-        raise SchemaDrift("upload response missing file_uuid")
+        raise SchemaDrift(
+            "claude.ai's /upload response is missing the expected "
+            "`file_uuid` (or `uuid`) field. Schema drift on Anthropic's side."
+        )
     return fu

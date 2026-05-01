@@ -25,23 +25,41 @@ from claude_migrate.errors import (
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("exc", "expected_code"),
-    [
+def _make_typed_errors() -> list[tuple[Exception, int]]:
+    """Build the typed-error → exit-code matrix lazily so the imports happen
+    once at call time, not at module-import (cleaner test discovery)."""
+    from claude_migrate.errors import (
+        EndpointChanged,
+        KeyringUnavailable,
+        RateLimited,
+        SchemaDrift,
+        TLSReject,
+    )
+    return [
         (AuthExpired("session ended"), 75),       # EXIT_TEMPFAIL
         (CloudflareChallenge("blocked"), 75),
         (ClientVersionStale("stale"), 75),
         (NetworkError("disconnected"), 75),
+        (RateLimited("quota exhausted"), 75),
+        (EndpointChanged("404 on /api/foo"), 75),
+        (TLSReject("403 forbidden"), 75),
+        (SchemaDrift("body shape changed"), 75),
         (AuthInvalid("malformed"), 2),
         (AuthMissing("no profile"), 2),
+        (KeyringUnavailable("no backend"), 2),
         (AuthError("generic auth"), 2),
         (ClaudeMigrateError("misc"), 1),
-    ],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_code"), _make_typed_errors(),
 )
 def test_run_maps_typed_errors_to_exit_codes(
     exc: Exception, expected_code: int, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_run translates each known typed error into the documented exit code."""
+    """_run translates each typed error into the documented exit code, with a
+    specific recovery hint for the common ones."""
     # Silence the desktop notification side effect on AuthExpired.
     monkeypatch.setattr(cli_mod, "notify", lambda title, body: None)
 
@@ -62,6 +80,114 @@ def test_run_keyboard_interrupt_exits_130(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(SystemExit) as exit_info:
         _run(interrupt())
     assert exit_info.value.code == 130
+
+
+def test_run_tls_reject_surfaces_stale_cookies_recovery_hint(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The user's exact pain point: 403 without CF body used to render as
+    'Auth error: TLS fingerprint reject', which sounds like a low-level
+    networking bug. The new shape: the exception's own message (which
+    `client.py` already phrases as "without a Cloudflare challenge"
+    explanation) is the title, and the recovery hints lead with the
+    most-common fix — re-paste cookies."""
+    from claude_migrate.errors import TLSReject
+
+    monkeypatch.setattr(cli_mod, "notify", lambda title, body: None)
+
+    # Use the message shape `client.py` actually raises with.
+    raised_msg = (
+        "GET /api/bootstrap returned 403 without a Cloudflare challenge "
+        "(usually a stale session cookie; sometimes an outdated TLS fingerprint)"
+    )
+
+    async def boom() -> None:
+        raise TLSReject(raised_msg)
+
+    with pytest.raises(SystemExit):
+        _run(boom())
+    captured = capsys.readouterr()
+    err = captured.err
+    # The exception message itself is the title (no redundant prefix from _run).
+    assert raised_msg in err
+    # First recovery hint leads with stale cookies, not the TLS fingerprint angle.
+    assert "stale" in err.lower()
+    assert "claude-migrate add" in err
+    # The TLS fingerprint angle still appears as a backup-hint, just AFTER
+    # the cookie-recovery path. (The exception's own title also mentions
+    # "TLS fingerprint" because the inner message hedges; we anchor the
+    # ordering check on the recovery-hint-specific phrasing.)
+    assert "fingerprint may be outdated" in err
+    assert err.index("Re-paste cookies") < err.index("fingerprint may be outdated")
+
+
+def test_run_rate_limited_explains_pro_limit_and_archive_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """RateLimited handler must surface the 5h/45-msg hard wall and the
+    --archive-only / Max 5x escape hatches."""
+    from claude_migrate.errors import RateLimited
+
+    monkeypatch.setattr(cli_mod, "notify", lambda title, body: None)
+
+    async def boom() -> None:
+        raise RateLimited(
+            "claude.ai rate-limited the request (429)",
+            retry_after_sec=120.0,
+        )
+
+    with pytest.raises(SystemExit):
+        _run(boom())
+    captured = capsys.readouterr()
+    err = captured.err
+    assert "rate-limited" in err.lower()
+    # Retry-After hint shown when present.
+    assert "120" in err
+    # Pro-plan context + escape hatches mentioned.
+    assert "5-hour" in err
+    assert "--archive-only" in err
+    assert "Max 5x" in err
+
+
+def test_run_endpoint_changed_points_at_issue_tracker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 404 on a documented endpoint usually means Anthropic moved
+    something; we tell the user so and link to the issue tracker."""
+    from claude_migrate.errors import EndpointChanged
+
+    monkeypatch.setattr(cli_mod, "notify", lambda title, body: None)
+
+    async def boom() -> None:
+        raise EndpointChanged("/api/foo returned 404")
+
+    with pytest.raises(SystemExit):
+        _run(boom())
+    captured = capsys.readouterr()
+    err = captured.err
+    assert "404" in err
+    assert "issues" in err.lower()
+
+
+def test_emit_error_format_is_consistent(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """_emit_error: blank line, title, then arrow-prefixed recovery hints,
+    all to stderr."""
+    from claude_migrate.cli import _emit_error
+    _emit_error(
+        "Something went wrong: details",
+        "First fix",
+        "Second fix",
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""  # nothing on stdout
+    err_lines = captured.err.splitlines()
+    # Leading blank line.
+    assert err_lines[0] == ""
+    assert err_lines[1] == "Something went wrong: details"
+    assert err_lines[2] == "  → First fix"
+    assert err_lines[3] == "  → Second fix"
 
 
 def test_run_returns_value_on_success() -> None:

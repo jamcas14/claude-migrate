@@ -91,7 +91,12 @@ async def archive_to_project(
                 },
             )
             if not isinstance(created, dict) or not isinstance(created.get("uuid"), str):
-                raise SchemaDrift("archive: project create returned no uuid")
+                raise SchemaDrift(
+                    "claude.ai's /projects POST didn't return a `uuid` field "
+                    "for the new archive project. Schema drift on Anthropic's "
+                    "side; the tool can't proceed without somewhere to write "
+                    "the docs."
+                )
             project_uuid = created["uuid"]
             summary.project_uuid = project_uuid
             log.info(

@@ -153,7 +153,12 @@ async def fetch_conversation_full(
     except EndpointChanged:
         return None
     if not isinstance(payload, dict):
-        raise SchemaDrift(f"conversation {conv_uuid} returned non-dict body")
+        raise SchemaDrift(
+            f"claude.ai's GET /chat_conversations/{conv_uuid} returned a "
+            f"{type(payload).__name__} (expected an object). Schema drift on "
+            "Anthropic's side; this conversation can't be backed up until the "
+            "API is fixed or the tool is updated."
+        )
     raw_path = write_raw(f"conv-{conv_uuid[:8]}", payload)
     with transaction(conn):
         upsert_conversation(conn, org_uuid, payload, raw_path=str(raw_path))

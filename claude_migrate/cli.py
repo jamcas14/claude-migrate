@@ -45,7 +45,12 @@ from .errors import (
     ClaudeMigrateError,
     ClientVersionStale,
     CloudflareChallenge,
+    EndpointChanged,
+    KeyringUnavailable,
     NetworkError,
+    RateLimited,
+    SchemaDrift,
+    TLSReject,
 )
 from .fetch import dump_all
 from .memory import prepare as memory_prepare
@@ -212,6 +217,20 @@ def _setup_logging(quiet: bool, verbose: bool) -> None:
     )
 
 
+def _emit_error(title: str, *recovery: str) -> None:
+    """Standard CLI error format: leading blank line, one-sentence title,
+    then arrow-prefixed recovery hints. Used by every `_run` except branch
+    so the user gets a consistent shape: WHAT failed, then WHAT to do.
+
+    All output goes to stderr. Recovery hints are listed in priority order
+    (most-likely fix first) so users who only read the first hint usually
+    succeed.
+    """
+    click.echo(f"\n{title}", err=True)
+    for hint in recovery:
+        click.echo(f"  → {hint}", err=True)
+
+
 def _run[T](coro: Coroutine[Any, Any, T]) -> T:
     """Run a coroutine, mapping typed errors → friendly exit codes.
 
@@ -224,42 +243,124 @@ def _run[T](coro: Coroutine[Any, Any, T]) -> T:
         click.echo("\nInterrupted.", err=True)
         _exit(130)
     except AuthExpired as e:
-        click.echo(f"\nSession expired: {e}", err=True)
-        click.echo(
-            "Run `claude-migrate add <profile>` to re-paste cookies, then "
-            "re-run the same command to resume.",
-            err=True,
+        _emit_error(
+            str(e),
+            "Re-paste cookies: `claude-migrate add <profile>`",
+            "Then re-run the same command. Idempotent — picks up where it left off.",
         )
         notify("claude-migrate", "Session expired — re-auth required.")
         _exit(EXIT_TEMPFAIL)
     except CloudflareChallenge as e:
-        click.echo(f"\nCloudflare challenge: {e}", err=True)
-        click.echo(
-            "Refresh https://claude.ai once in your browser (this gets you a "
-            "fresh cf_clearance), then `claude-migrate add <profile>`.",
-            err=True,
+        _emit_error(
+            str(e),
+            "Open https://claude.ai once in your browser to get a fresh `cf_clearance`.",
+            "Re-paste cookies: `claude-migrate add <profile>`",
+            "Then re-run the same command.",
+        )
+        _exit(EXIT_TEMPFAIL)
+    except TLSReject as e:
+        # 403 without the Cloudflare-challenge body. Most-common cause is a
+        # stale session cookie that Anthropic's origin rejects directly,
+        # bypassing Cloudflare's interstitial. Less common: TLS fingerprint
+        # rejection (would also fail in `whoami` for every profile).
+        _emit_error(
+            str(e),
+            "Most likely: this profile's cookies are stale.",
+            "  • Re-paste cookies: `claude-migrate add <profile>`",
+            "  • Verify with: `claude-migrate whoami <profile>`",
+            "If multiple profiles fail the same way, the curl_cffi TLS fingerprint may be "
+            "outdated — try `pip install -U curl_cffi`.",
+            "If still failing, your account may be temporarily restricted; "
+            "open claude.ai in an incognito browser to verify access.",
         )
         _exit(EXIT_TEMPFAIL)
     except ClientVersionStale as e:
         settings = load_settings()
-        click.echo(f"\n{e}", err=True)
-        click.echo(
-            f"\nCurrent value: client_version={settings.client_version!r}\n",
-            err=True,
+        _emit_error(
+            str(e),
+            f"Current `client_version` is {settings.client_version!r}.",
+            "Capture fresh values from a real browser session: "
+            "`claude-migrate headers-help`",
+            "Then `claude-migrate config edit` or set CLAUDE_MIGRATE_CLIENT_SHA env var.",
         )
         click.echo(CLIENT_VERSION_HELP, err=True)
         _exit(EXIT_TEMPFAIL)
+    except RateLimited as e:
+        retry_after = e.retry_after_sec
+        wait_msg = (
+            f"claude.ai sent Retry-After: {retry_after:.0f}s — wait at least that long."
+            if retry_after else
+            "claude.ai didn't send a Retry-After hint; usually 5+ minutes."
+        )
+        _emit_error(
+            str(e),
+            wait_msg,
+            "On Pro accounts the /completion bucket is ~45 messages per 5-hour rolling window.",
+            "Faster paths: `--archive-only` (skip /completion entirely; minutes), "
+            "or upgrade to Max 5x for one window of bulk migration.",
+            "See README 'Tuning' section for the full speed playbook.",
+        )
+        _exit(EXIT_TEMPFAIL)
+    except EndpointChanged as e:
+        _emit_error(
+            str(e),
+            "claude.ai's web API changes occasionally. The tool may need an update.",
+            "Run `claude-migrate doctor` for environment details.",
+            "If the error persists on a fresh checkout, open an issue: "
+            "https://github.com/jamcas14/claude-migrate/issues",
+        )
+        _exit(EXIT_TEMPFAIL)
     except (AuthInvalid, AuthMissing) as e:
+        # AuthInvalid messages are already pre-formatted with specific recovery
+        # hints (cookie format guidance, "run `add <name>`", etc.). AuthMissing
+        # is a one-liner. Just emit verbatim — adding an arrow-list would be
+        # noisy redundancy.
         click.echo(f"\n{e}", err=True)
         _exit(2)
-    except AuthError as e:
-        click.echo(f"\nAuth error: {e}", err=True)
+    except KeyringUnavailable as e:
+        _emit_error(
+            f"OS keychain is unavailable: {e}",
+            "Install a keychain backend: `gnome-keyring` (Linux), Keychain Access "
+            "(macOS, built-in), or Credential Manager (Windows, built-in).",
+            "Or run anyway — claude-migrate falls back to an AES-GCM-encrypted file "
+            "in your config dir. You'll be prompted for a passphrase.",
+        )
         _exit(2)
+    except AuthError as e:
+        # Catch-all for any AuthError subclass not handled above. Rare;
+        # if you see this regularly, that subclass needs its own branch.
+        _emit_error(
+            f"Authentication error: {e}",
+            "Re-paste cookies: `claude-migrate add <profile>`",
+        )
+        _exit(2)
+    except SchemaDrift as e:
+        _emit_error(
+            str(e),
+            "This usually means Anthropic shipped a change. "
+            "The tool may need an update.",
+            "Workaround: skip the affected step "
+            "(--no-prefs / --no-styles / --no-projects / --no-conversations).",
+            "Open an issue with the error message: "
+            "https://github.com/jamcas14/claude-migrate/issues",
+        )
+        _exit(EXIT_TEMPFAIL)
     except NetworkError as e:
-        click.echo(f"\nNetwork error: {e}", err=True)
+        _emit_error(
+            str(e),
+            "Check your connection / VPN / proxy.",
+            "If this is a 5xx from claude.ai's edge, it's usually transient — "
+            "wait a minute and re-run. Idempotent.",
+        )
         _exit(EXIT_TEMPFAIL)
     except ClaudeMigrateError as e:
-        click.echo(f"\nError: {e}", err=True)
+        # Final catch-all for any typed error not specifically handled above.
+        _emit_error(
+            f"{type(e).__name__}: {e}",
+            "Run `claude-migrate doctor` for environment details.",
+            "If this looks like a tool bug, open an issue: "
+            "https://github.com/jamcas14/claude-migrate/issues",
+        )
         _exit(1)
 
 

@@ -145,7 +145,9 @@ async def restore_styles(
                 return WorkerOutcome.failed(f"style: {e}")
             new_uuid = created.get("uuid") if isinstance(created, dict) else None
             if not isinstance(new_uuid, str):
-                return WorkerOutcome.failed("style: create returned no uuid")
+                return WorkerOutcome.failed(
+                    "style: claude.ai's POST /custom_styles returned no uuid"
+                )
             return WorkerOutcome.ok(new_uuid)
 
         outcome = await migrate_row(
@@ -201,7 +203,9 @@ async def restore_projects(
                     )
                     new_uuid = created.get("uuid") if isinstance(created, dict) else None
                     if not isinstance(new_uuid, str):
-                        return WorkerOutcome.failed("project: create returned no uuid")
+                        return WorkerOutcome.failed(
+                            "project: claude.ai's POST /projects returned no uuid"
+                        )
                     if row["prompt_template"]:
                         await client.put_json(
                             f"/api/organizations/{target_org}/projects/{new_uuid}",
@@ -506,7 +510,12 @@ async def restore_conversation(
             body=create_body,
         )
         if not isinstance(created, dict) or not isinstance(created.get("uuid"), str):
-            raise SchemaDrift("conversation create returned no uuid")
+            raise SchemaDrift(
+                "claude.ai's POST /chat_conversations didn't return a `uuid` "
+                "field for the new chat. Schema drift on Anthropic's side; "
+                "this conversation can't be migrated until the API is fixed "
+                "or the tool is updated."
+            )
         new_uuid = created["uuid"]
         await send_payload(client, target_org, new_uuid, payload)
         return WorkerOutcome.ok(new_uuid)

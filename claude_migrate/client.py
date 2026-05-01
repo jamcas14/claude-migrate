@@ -203,11 +203,13 @@ class ClaudeClient:
                 except json.JSONDecodeError as e:
                     if "Just a moment" in text_preview or "cf-mitigated" in text_preview:
                         raise CloudflareChallenge(
-                            f"Cloudflare interstitial leaked through {status}"
+                            f"a Cloudflare interstitial leaked through with status {status}"
                         ) from e
                     raise
             if status == 401:
-                raise AuthExpired(f"{method} {path} returned 401")
+                raise AuthExpired(
+                    f"claude.ai rejected the session cookie for {method} {path} (401)"
+                )
             if status == 403:
                 if (
                     "Just a moment" in text_preview
@@ -215,22 +217,31 @@ class ClaudeClient:
                     or "challenge-platform" in text_preview
                 ):
                     raise CloudflareChallenge(
-                        "Cloudflare challenged the request — refresh cf_clearance"
+                        f"Cloudflare blocked {method} {path} (cf_clearance is "
+                        "stale or the IP is being challenged)"
                     )
-                raise TLSReject("403 with no Cloudflare body — TLS fingerprint reject")
+                raise TLSReject(
+                    f"{method} {path} returned 403 without a Cloudflare challenge "
+                    "(usually a stale session cookie; sometimes an outdated TLS "
+                    "fingerprint)"
+                )
             if status == 404:
-                raise EndpointChanged(f"{method} {path} returned 404")
+                raise EndpointChanged(
+                    f"claude.ai's {method} {path} endpoint returned 404 — moved or removed"
+                )
             if status in (400, 422):
                 # Distinguish API validation errors (JSON body with a message)
                 # from fingerprint rejections (HTML / generic Cloudflare body).
                 api_msg = _extract_api_error(body)
                 if api_msg:
                     raise NetworkError(
-                        f"{method} {path} → {status}: {api_msg}"
+                        f"claude.ai rejected {method} {path} with HTTP {status}: {api_msg}"
                     )
                 raise ClientVersionStale(
-                    f"{method} {path} returned {status}. The most likely cause is a "
-                    "stale or missing `anthropic-client-version` / `anthropic-client-sha` header."
+                    f"{method} {path} returned {status}. Most common cause: a "
+                    "stale or missing `anthropic-client-version` / "
+                    "`anthropic-client-sha` request header — Anthropic rotates "
+                    "these every few weeks."
                 )
             if status == 429:
                 # Empirical instrumentation: capture rate-limit signaling so
@@ -253,7 +264,8 @@ class ClaudeClient:
                 )
                 if attempt > MAX_RETRIES:
                     raise RateLimited(
-                        f"429 after {MAX_RETRIES} retries",
+                        f"claude.ai returned 429 on {method} {path} after "
+                        f"{MAX_RETRIES} retries",
                         retry_after_sec=retry_after_sec,
                     )
                 # Prefer the server's Retry-After when present; fall back to
@@ -268,15 +280,20 @@ class ClaudeClient:
                 continue
             if 500 <= status < 600:
                 if attempt > MAX_RETRIES:
-                    raise NetworkError(f"{method} {path} → {status} after retries")
+                    raise NetworkError(
+                        f"claude.ai returned {status} on {method} {path} after "
+                        f"{MAX_RETRIES} retries (server error; usually transient)"
+                    )
                 base = BACKOFF_SCHEDULE[min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)]
                 delay = base + random.uniform(0, 0.5)
                 log.warning("server_error_retry",
                             path=path, status=status, retry_in_sec=delay)
                 await asyncio.sleep(delay)  # outside _sem
                 continue
-            raise NetworkError(f"unexpected status {status} for {method} {path}: "
-                               f"{text_preview[:200]}")
+            raise NetworkError(
+                f"claude.ai returned an unexpected HTTP {status} for "
+                f"{method} {path}: {text_preview[:200]}"
+            )
 
     async def get_json(self, path: str, **kw: Any) -> Any:
         return await self.request("GET", path, **kw)
@@ -331,11 +348,16 @@ class ClaudeClient:
                         timeout=timeout,
                     )
                 except RequestsError as e:
-                    raise NetworkError(f"stream {url}: {e}") from e
+                    raise NetworkError(
+                        f"could not open stream to {url}: {e}"
+                    ) from e
                 async with stream_ctx as resp:
                     status = resp.status_code
                     if status == 401:
-                        raise AuthExpired(f"{path} 401")
+                        raise AuthExpired(
+                            f"claude.ai rejected the session cookie when opening "
+                            f"the stream for {path} (401)"
+                        )
                     if status == 403:
                         preview = await _read_body_preview(resp, max_bytes=400)
                         if (
@@ -343,25 +365,33 @@ class ClaudeClient:
                             or "cf-mitigated" in preview
                             or "challenge-platform" in preview
                         ):
-                            raise CloudflareChallenge(f"{path} 403 (Cloudflare)")
-                        raise TLSReject(f"{path} 403 (TLS fingerprint)")
+                            raise CloudflareChallenge(
+                                f"Cloudflare blocked the stream for {path} "
+                                "(cf_clearance is stale or the IP is being challenged)"
+                            )
+                        raise TLSReject(
+                            f"stream {path} returned 403 without a Cloudflare "
+                            "challenge (usually a stale session cookie; sometimes "
+                            "an outdated TLS fingerprint)"
+                        )
                     if status == 404:
-                        raise EndpointChanged(f"stream {path} returned 404")
+                        raise EndpointChanged(
+                            f"claude.ai's stream endpoint {path} returned 404 "
+                            "— moved or removed"
+                        )
                     if status in (400, 422):
-                        # Mirror request()'s split: typed ClientVersionStale
-                        # for fingerprint-stale rejections so the user gets
-                        # the headers-help recovery message, not an opaque
-                        # NetworkError.
                         preview = await _read_body_preview(resp, max_bytes=4096)
                         api_msg = _extract_api_error(preview.encode("utf-8"))
                         if api_msg:
                             raise NetworkError(
-                                f"stream {path} → {status}: {api_msg}"
+                                f"claude.ai rejected the stream for {path} with "
+                                f"HTTP {status}: {api_msg}"
                             )
                         raise ClientVersionStale(
-                            f"stream {path} returned {status}. The most likely "
-                            "cause is a stale or missing `anthropic-client-version` "
-                            "/ `anthropic-client-sha` header."
+                            f"stream {path} returned {status}. Most common cause: "
+                            "a stale or missing `anthropic-client-version` / "
+                            "`anthropic-client-sha` request header — Anthropic "
+                            "rotates these every few weeks."
                         )
                     if status == 429:
                         # Drop the inner-retry on 429: /completion is the only
@@ -385,13 +415,15 @@ class ClaudeClient:
                             ),
                         )
                         raise RateLimited(
-                            f"stream {path} returned 429",
+                            f"claude.ai rate-limited the stream for {path} (429)",
                             retry_after_sec=retry_after_sec,
                         )
                     if 500 <= status < 600:
                         if attempt > MAX_RETRIES:
                             raise NetworkError(
-                                f"stream {path} {status} after retries"
+                                f"claude.ai returned {status} on the stream for "
+                                f"{path} after {MAX_RETRIES} retries (server "
+                                "error; usually transient)"
                             )
                         base = BACKOFF_SCHEDULE[
                             min(attempt - 1, len(BACKOFF_SCHEDULE) - 1)
@@ -404,7 +436,8 @@ class ClaudeClient:
                     elif not (200 <= status < 300):
                         preview = await _read_body_preview(resp, max_bytes=400)
                         raise NetworkError(
-                            f"stream {path} status {status}: {preview[:400]}"
+                            f"claude.ai returned an unexpected HTTP {status} on "
+                            f"the stream for {path}: {preview[:400]}"
                         )
                     else:
                         # Happy path: yield each line. We yield while still
@@ -419,7 +452,9 @@ class ClaudeClient:
                                     line = line.decode("utf-8", errors="replace")
                                 yield line
                         except RequestsError as e:
-                            raise NetworkError(f"stream {url}: {e}") from e
+                            raise NetworkError(
+                                f"stream {url} disconnected mid-response: {e}"
+                            ) from e
                         return  # stream completed
             # Both contexts have exited; _sem and the session ctx are released.
             # `retry_after` is set iff we took a retry branch above; the other
@@ -482,7 +517,9 @@ def map_status_to_typed_error(
         return
     text_preview = body[:4096].decode("utf-8", errors="replace")
     if status == 401:
-        raise AuthExpired(f"{method} {path} returned 401")
+        raise AuthExpired(
+            f"claude.ai rejected the session cookie for {method} {path} (401)"
+        )
     if status == 403:
         if (
             "Just a moment" in text_preview
@@ -490,25 +527,41 @@ def map_status_to_typed_error(
             or "challenge-platform" in text_preview
         ):
             raise CloudflareChallenge(
-                "Cloudflare challenged the request — refresh cf_clearance"
+                f"Cloudflare blocked {method} {path} (cf_clearance is "
+                "stale or the IP is being challenged)"
             )
-        raise TLSReject("403 with no Cloudflare body — TLS fingerprint reject")
+        raise TLSReject(
+            f"{method} {path} returned 403 without a Cloudflare challenge "
+            "(usually a stale session cookie; sometimes an outdated TLS "
+            "fingerprint)"
+        )
     if status == 404:
-        raise EndpointChanged(f"{method} {path} returned 404")
+        raise EndpointChanged(
+            f"claude.ai's {method} {path} endpoint returned 404 — moved or removed"
+        )
     if status in (400, 422):
         api_msg = _extract_api_error(body)
         if api_msg:
-            raise NetworkError(f"{method} {path} → {status}: {api_msg}")
+            raise NetworkError(
+                f"claude.ai rejected {method} {path} with HTTP {status}: {api_msg}"
+            )
         raise ClientVersionStale(
-            f"{method} {path} returned {status}. The most likely cause is a "
-            "stale or missing `anthropic-client-version` / `anthropic-client-sha` header."
+            f"{method} {path} returned {status}. Most common cause: a stale "
+            "or missing `anthropic-client-version` / `anthropic-client-sha` "
+            "request header — Anthropic rotates these every few weeks."
         )
     if status == 429:
-        raise RateLimited(f"{method} {path} returned 429")
+        raise RateLimited(
+            f"claude.ai rate-limited {method} {path} (429)"
+        )
     if 500 <= status < 600:
-        raise NetworkError(f"{method} {path} → {status}")
+        raise NetworkError(
+            f"claude.ai returned {status} on {method} {path} (server error; "
+            "usually transient)"
+        )
     raise NetworkError(
-        f"unexpected status {status} for {method} {path}: {text_preview[:200]}"
+        f"claude.ai returned an unexpected HTTP {status} for {method} {path}: "
+        f"{text_preview[:200]}"
     )
 
 

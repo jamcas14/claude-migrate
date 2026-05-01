@@ -84,17 +84,30 @@ async def discover_org(client: ClaudeClient) -> tuple[str, str | None, str | Non
     try:
         orgs = await client.get_json("/api/organizations")
     except EndpointChanged as e:
-        raise NetworkError("Both /api/bootstrap and /api/organizations are unavailable") from e
+        raise NetworkError(
+            "claude.ai returned 404 on both /api/bootstrap and /api/organizations "
+            "— org discovery is impossible. Either Anthropic moved both endpoints "
+            "(tool may need an update) or your network is intercepting requests."
+        ) from e
 
     if not isinstance(orgs, list) or not orgs:
-        raise SchemaDrift("/api/organizations returned an unexpected shape")
+        raise SchemaDrift(
+            "claude.ai's /api/organizations didn't return a non-empty list "
+            "of orgs (got {type(orgs).__name__}). Schema drift on Anthropic's "
+            "side, or your account has no organizations attached."
+        )
 
     first = orgs[0]
     if not isinstance(first, dict):
-        raise SchemaDrift("first organization entry is not an object")
+        raise SchemaDrift(
+            "claude.ai's /api/organizations[0] isn't an object — schema drift."
+        )
     uuid_field = first.get("uuid") or first.get("id")
     if not isinstance(uuid_field, str):
-        raise SchemaDrift("organization missing uuid")
+        raise SchemaDrift(
+            "claude.ai's /api/organizations[0] is missing the expected `uuid` "
+            "(or `id`) field — schema drift."
+        )
     name_field = first.get("name")
     name = name_field if isinstance(name_field, str) else None
     email_only: str | None = None
