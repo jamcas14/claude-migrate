@@ -415,6 +415,10 @@ async def reorder_conversations(
 async def delete_conversation(
     client: ClaudeClient, target_org: str, conv_uuid: str
 ) -> bool:
+    """Best-effort DELETE. Catches the full `ClaudeMigrateError` family so a
+    429/422 on one orphan during `cleanup` doesn't abort the whole loop —
+    the Pacer at the call site uses our return value to decide whether to
+    back off."""
     try:
         await client.request(
             "DELETE",
@@ -422,8 +426,11 @@ async def delete_conversation(
             expect_json=False,
         )
         return True
-    except (EndpointChanged, NetworkError) as e:
-        log.warning("orphan_delete_failed", uuid=conv_uuid, err=str(e))
+    except ClaudeMigrateError as e:
+        log.warning(
+            "orphan_delete_failed",
+            uuid=conv_uuid, err=str(e), err_type=type(e).__name__,
+        )
         return False
 
 
@@ -499,7 +506,14 @@ async def restore_conversation(
 async def _cleanup_partial(
     client: ClaudeClient, target_org: str, new_uuid: str | None
 ) -> None:
-    """Best-effort delete of a half-created conversation."""
+    """Best-effort delete of a half-created conversation.
+
+    Catches the entire `ClaudeMigrateError` family so a cleanup-during-
+    cleanup failure (e.g., the original op 429ed and the DELETE 429s too)
+    can't escape this helper and replace the in-flight exception that
+    `restore_conversation`'s caller expects to handle. The user can run
+    `claude-migrate cleanup` to sweep the orphan later.
+    """
     if not new_uuid:
         return
     try:
@@ -509,8 +523,11 @@ async def _cleanup_partial(
             expect_json=False,
             timeout=15.0,
         )
-    except (EndpointChanged, NetworkError) as e:
-        log.warning("partial_cleanup_failed", uuid=new_uuid, err=str(e))
+    except ClaudeMigrateError as e:
+        log.warning(
+            "partial_cleanup_failed",
+            uuid=new_uuid, err=str(e), err_type=type(e).__name__,
+        )
 
 
 async def restore_all_conversations(
@@ -639,4 +656,14 @@ async def restore_all_conversations(
         async with sem:
             await one(idx, row)
 
-    await asyncio.gather(*(gated(idx, r) for idx, r in enumerate(rows)))
+    # return_exceptions=True so an unhandled exception in one worker doesn't
+    # cancel its siblings mid-create — that would leave orphan empty chats
+    # on target. Mirror restore_projects: collect, then re-raise only the
+    # session-fatal types so the orchestrator surfaces re-auth.
+    results = await asyncio.gather(
+        *(gated(idx, r) for idx, r in enumerate(rows)),
+        return_exceptions=True,
+    )
+    for res in results:
+        if isinstance(res, AuthExpired | CloudflareChallenge | TLSReject):
+            raise res

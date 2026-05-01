@@ -10,6 +10,7 @@ import pytest
 
 from claude_migrate.errors import (
     AuthExpired,
+    ClientVersionStale,
     CloudflareChallenge,
     EndpointChanged,
     NetworkError,
@@ -17,6 +18,8 @@ from claude_migrate.errors import (
     TLSReject,
 )
 from claude_migrate.restore import (
+    _cleanup_partial,
+    delete_conversation,
     reorder_conversations,
     restore_profile_prefs,
 )
@@ -162,3 +165,106 @@ async def test_reorder_records_other_typed_errors(
     assert touched == 0
     assert len(errors) == 1
     assert "EndpointChanged" in errors[0][1] or "missing" in errors[0][1]
+
+
+# ---------------------------------------------------------------------------
+# _cleanup_partial / delete_conversation — must NOT escape on retryable
+# errors during a failed-cleanup-of-a-failed-op cascade.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RateLimited("429 again"),
+        ClientVersionStale("stale headers"),
+        EndpointChanged("404"),
+        NetworkError("network down"),
+        AuthExpired("session ended"),
+        CloudflareChallenge("blocked"),
+        TLSReject("fingerprint reject"),
+    ],
+)
+async def test_cleanup_partial_swallows_every_typed_error(exc: Exception) -> None:
+    """_cleanup_partial is best-effort; nothing it does should be allowed to
+    escape and replace the in-flight exception its caller is handling."""
+    client = MagicMock()
+    client.request = AsyncMock(side_effect=exc)
+    # Must NOT raise.
+    await _cleanup_partial(client, "tgt-org", "new-uuid")
+
+
+async def test_cleanup_partial_no_op_when_no_uuid() -> None:
+    """If the create call never returned a uuid, there's nothing to clean up."""
+    client = MagicMock()
+    client.request = AsyncMock(side_effect=AssertionError("should not be called"))
+    await _cleanup_partial(client, "tgt-org", None)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RateLimited("429"),
+        ClientVersionStale("stale"),
+        AuthExpired("session ended"),
+    ],
+)
+async def test_delete_conversation_returns_false_on_typed_errors(exc: Exception) -> None:
+    """cleanup CLI's per-orphan loop relies on the boolean return; it must
+    NOT propagate the exception (would abort the whole sweep)."""
+    client = MagicMock()
+    client.request = AsyncMock(side_effect=exc)
+    ok = await delete_conversation(client, "tgt-org", "uuid")
+    assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# _upload_attachment status mapping (issue 2.3 from round-5 review).
+# ---------------------------------------------------------------------------
+
+
+class _FakeUploadResp:
+    def __init__(self, status: int, body: bytes = b"") -> None:
+        self.status_code = status
+        self.content = body
+
+
+class _FakeUploadSession:
+    def __init__(self, resp: _FakeUploadResp) -> None:
+        self._resp = resp
+
+    async def post(self, url: str, **kw: Any) -> _FakeUploadResp:
+        return self._resp
+
+    async def close(self) -> None: ...
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (401, b"", AuthExpired),
+        (429, b"", RateLimited),
+        (404, b"", EndpointChanged),
+        (400, b"<html>cf</html>", ClientVersionStale),
+        (403, b"<title>Just a moment...</title>", CloudflareChallenge),
+        (403, b"forbidden", TLSReject),
+        (500, b"", NetworkError),
+    ],
+)
+async def test_upload_status_mapped_to_typed_error(
+    status: int, body: bytes, expected: type[Exception],
+) -> None:
+    """_upload_attachment used to flatten everything to NetworkError; now it
+    routes through map_status_to_typed_error so the orchestrator sees the
+    same typed errors the rest of the codebase expects."""
+    from claude_migrate.client import ClaudeClient, Credentials
+    from claude_migrate.config import load_settings
+    from claude_migrate.transport import _upload_attachment
+
+    client = ClaudeClient(
+        Credentials(session_key="sk-ant-sid01-X", cf_clearance="cf-X"),
+        load_settings(),
+    )
+    client._session = _FakeUploadSession(_FakeUploadResp(status, body))
+    with pytest.raises(expected):
+        await _upload_attachment(client, "org", "f.md", "content")

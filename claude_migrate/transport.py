@@ -17,7 +17,7 @@ import json
 
 from curl_cffi import CurlMime
 
-from .client import ClaudeClient
+from .client import ClaudeClient, map_status_to_typed_error
 from .errors import NetworkError, SchemaDrift
 from .render import (
     AttachmentPayload,
@@ -176,18 +176,25 @@ async def _upload_attachment(
         data=content.encode("utf-8"),
         content_type="text/markdown",
     )
+    upload_path = f"/api/{target_org}/upload"
     try:
         async with client.session() as sess:
             resp = await sess.post(
-                f"{client.settings.base_url}/api/{target_org}/upload",
+                f"{client.settings.base_url}{upload_path}",
                 multipart=mime,
                 headers=client._headers({"Accept": "application/json"}),
                 timeout=UPLOAD_TIMEOUT,
             )
     finally:
         mime.close()
-    if resp.status_code != 200:
-        raise NetworkError(f"upload returned {resp.status_code}")
+    # Route through the shared status mapper so 401/403/429/etc. raise the
+    # correct typed exception — without this, every non-200 became
+    # NetworkError and the orchestrator's session-fatal handlers (and the
+    # Pacer's RateLimited cooldown) couldn't see the right signal.
+    map_status_to_typed_error(
+        resp.status_code, resp.content or b"",
+        method="POST", path=upload_path,
+    )
     try:
         j = json.loads(resp.content)
     except json.JSONDecodeError as e:

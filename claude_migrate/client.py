@@ -375,6 +375,54 @@ async def _read_body_preview(resp: Any, *, max_bytes: int = 400) -> str:
     return "".join(parts)[:max_bytes]
 
 
+def map_status_to_typed_error(
+    status: int, body: bytes, *, method: str, path: str,
+) -> None:
+    """Translate a non-2xx HTTP status into the right typed exception.
+
+    Centralizes the 401/403/404/400/422/429/5xx mapping so callers other
+    than `request()` (e.g., the multipart upload in `transport`, future
+    streaming fall-back paths) raise the same typed errors that the rest
+    of the codebase's `except` clauses expect.
+
+    Returns None for 2xx (the caller should keep going); raises one of the
+    typed exception subclasses otherwise. Does NOT retry — that's the
+    caller's responsibility, since retry semantics differ per call site.
+    """
+    if 200 <= status < 300:
+        return
+    text_preview = body[:4096].decode("utf-8", errors="replace")
+    if status == 401:
+        raise AuthExpired(f"{method} {path} returned 401")
+    if status == 403:
+        if (
+            "Just a moment" in text_preview
+            or "cf-mitigated" in text_preview
+            or "challenge-platform" in text_preview
+        ):
+            raise CloudflareChallenge(
+                "Cloudflare challenged the request — refresh cf_clearance"
+            )
+        raise TLSReject("403 with no Cloudflare body — TLS fingerprint reject")
+    if status == 404:
+        raise EndpointChanged(f"{method} {path} returned 404")
+    if status in (400, 422):
+        api_msg = _extract_api_error(body)
+        if api_msg:
+            raise NetworkError(f"{method} {path} → {status}: {api_msg}")
+        raise ClientVersionStale(
+            f"{method} {path} returned {status}. The most likely cause is a "
+            "stale or missing `anthropic-client-version` / `anthropic-client-sha` header."
+        )
+    if status == 429:
+        raise RateLimited(f"{method} {path} returned 429")
+    if 500 <= status < 600:
+        raise NetworkError(f"{method} {path} → {status}")
+    raise NetworkError(
+        f"unexpected status {status} for {method} {path}: {text_preview[:200]}"
+    )
+
+
 def _extract_api_error(body: bytes) -> str | None:
     """Return a human-readable API error message if `body` is JSON-shaped.
 
