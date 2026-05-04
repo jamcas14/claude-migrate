@@ -81,7 +81,13 @@ async def run_restore(
 
 def migration_status(target_profile: str) -> dict[str, Any]:
     """Read-only summary of migration_log + source archive for one profile.
-    Pure SQLite — no network calls."""
+    Pure SQLite — no network calls.
+
+    `target_ok` counts only `status='ok'` rows (fully loaded chats); the
+    separate `target_bookmarked` field carries the `--bookmark`-mode stub
+    counts so the CLI can render them as a distinct state instead of
+    silently bucketing them as "not done".
+    """
     conn = open_db()
     try:
         state = RestoreState(conn, target_profile)
@@ -95,9 +101,13 @@ def migration_status(target_profile: str) -> dict[str, Any]:
             "projects": state.migrated_count("project"),
             "styles": state.migrated_count("style"),
         }
+        target_bookmarked = {
+            "conversations": state.bookmarked_count(),
+        }
         return {
             "archive": archive,
             "target_ok": target_ok,
+            "target_bookmarked": target_bookmarked,
             "failures": state.recent_failures(),
             "last_activity": state.last_activity(),
         }

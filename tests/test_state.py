@@ -119,3 +119,53 @@ def test_state_for_status_command_shape(db_conn: sqlite3.Connection) -> None:
     assert len(failures) == 1
     assert failures[0]["object_type"] == "conversation"
     assert "RateLimited" in failures[0]["error"]
+
+
+def test_bookmarked_count_filters_by_status_and_profile(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """`bookmarked_count` returns ONLY conversation rows with status='bookmarked'
+    for THIS profile — error / ok / wrong-profile rows must not leak in."""
+    a = RestoreState(db_conn, "alpha")
+    b = RestoreState(db_conn, "beta")
+    # Three bookmarked stubs for alpha.
+    a.mark_bookmarked(source_uuid="c1", target_uuid="t1")
+    a.mark_bookmarked(source_uuid="c2", target_uuid="t2")
+    a.mark_bookmarked(source_uuid="c3", target_uuid="t3")
+    # One loaded chat (status='ok') for alpha — must not count as bookmarked.
+    a.mark_ok(source_uuid="c4", object_type="conversation", target_uuid="t4")
+    # Beta has its own bookmarks — must not leak into alpha's count.
+    b.mark_bookmarked(source_uuid="c1", target_uuid="bt1")
+
+    assert a.bookmarked_count() == 3
+    assert b.bookmarked_count() == 1
+
+
+def test_already_bookmarked_returns_target_uuid_or_none(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """`already_bookmarked` is the gate the bookmark phase uses to skip
+    re-creating a stub on re-run, AND the gate the default phase uses to
+    refuse duplicating into a target that already has one."""
+    state = RestoreState(db_conn, "tgt")
+    assert state.already_bookmarked("c1") is None
+    state.mark_bookmarked(source_uuid="c1", target_uuid="tgt-c1")
+    assert state.already_bookmarked("c1") == "tgt-c1"
+    # Loaded (status='ok') conversations are NOT bookmarked.
+    state.mark_ok(source_uuid="c2", object_type="conversation", target_uuid="tgt-c2")
+    assert state.already_bookmarked("c2") is None
+
+
+def test_all_migrated_target_uuids_unions_ok_and_bookmarked(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """`cleanup` consults this set to refuse deletion of any chat the tool
+    owns — both fully-loaded and bookmarked-but-empty chats must appear."""
+    state = RestoreState(db_conn, "tgt")
+    state.mark_bookmarked(source_uuid="c1", target_uuid="t-bookmark")
+    state.mark_ok(source_uuid="c2", object_type="conversation", target_uuid="t-loaded")
+    state.mark_error(source_uuid="c3", object_type="conversation", error="boom")
+    # Project rows must not appear (cleanup operates on conversations only).
+    state.mark_ok(source_uuid="p1", object_type="project", target_uuid="t-proj")
+
+    assert state.all_migrated_target_uuids() == {"t-bookmark", "t-loaded"}

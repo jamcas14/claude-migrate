@@ -21,7 +21,9 @@ Anthropic's `claude.com/import-memory`.
 3. **All HTTP via `curl_cffi`** with `impersonate="chrome131"`. Plain
    `requests`/`httpx` get 403'd by Cloudflare on `claude.ai`.
 4. **Concurrency cap of 5** (`asyncio.Semaphore(5)` at the HTTP layer).
-   429 backoff: capped exponential `2 → 4 → 8 → 16 → 32 → 60`.
+   HTTP-layer 429 retry: capped exponential `2 → 4 → 8 → 16 → 32 → 60`.
+   Outer-loop 429 cooldown is owned by `runner.Pacer` (AIMD on per-success
+   sleep + server-`Retry-After` floor + cascade-abort after 5 in a row).
 5. **Encrypt secrets at rest.** Cookies live in OS keychain via `keyring`,
    with AES-256-GCM file fallback. Plaintext credentials on disk = critical bug.
 6. **Raw-first storage.** Every API response is gzipped to
@@ -30,8 +32,10 @@ Anthropic's `claude.com/import-memory`.
 7. **Idempotency.** `migration_log(source_uuid, target_profile)` is the
    primary key. Re-running any command must be safe and ~instant when there's
    nothing to do.
-8. **Dry-run default** for any command that mutates a remote account.
-   `--execute` opt-in.
+8. **Confirm before mutating a remote account.** Every command that writes
+   to a remote account prints a plan and asks `Proceed? [y/N]`. `--dry-run`
+   exits after the plan; `--yes` skips the prompt for automation. There is
+   no `--execute` flag — the default *is* execute-after-confirm.
 9. **Auth never silently fails.** Every auth failure produces a specific
    error message naming the likely cause and the exact recovery action.
 
@@ -47,13 +51,16 @@ Anthropic's `claude.com/import-memory`.
 | `render.py` | Stored conversation → XML transcript. Thinking blocks render as their `summaries[0].summary` (one-line UI summary), NOT raw thinking. |
 | `transport.py` | `/completion` SSE + multipart upload + `send_payload(...)` dispatch over `InlinePayload | AttachmentPayload | ChunkedPayload`. |
 | `store.py` | SQLite schema + UPSERTs + raw-sidecar writer. Idempotent on uuid. |
-| `state.py` | `RestoreState` — owns `migration_log` for one (conn, target_profile). Methods: `mark_ok`, `mark_error`, `already_migrated`, `project_map`, `pending_count`, `recent_failures`, `confirmed_conversations`, `drop`. |
-| `runner.py` | `WorkerOutcome` (typed result), `migrate_row(state, work)` (the per-row idempotency lifecycle), `Pacer` (rate-limit barrier with `before()` / `after()`). |
-| `restore.py` | Per-object-type restore loops on top of `runner` + `state`. Each loop is a small worker + `migrate_row`; the runner handles already-migrated checks, log writes, and pacing. |
+| `state.py` | `RestoreState` — owns `migration_log` for one (conn, target_profile). Methods: `mark_ok`, `mark_error`, `mark_bookmarked`, `already_migrated`, `already_bookmarked`, `project_map`, `pending_count`, `recent_failures`, `confirmed_conversations`, `bookmarked_conversations`, `all_migrated_target_uuids`, `drop`. Statuses: `'ok'` (loaded), `'bookmarked'` (`--bookmark`-mode stub, transcript not yet pasted), `'error'`. `already_migrated` filters on `'ok'` only — bookmark mode reads via `already_bookmarked`. |
+| `runner.py` | `WorkerOutcome` (typed result), `migrate_row(state, work)` (the per-row idempotency lifecycle), `Pacer` (AIMD per-success sleep + server-`Retry-After`-floored cooldown + cascade detection via `consecutive_rate_limits`). |
+| `restore.py` | Per-object-type restore loops on top of `runner` + `state`. Each loop is a small worker + `migrate_row`; the runner handles already-migrated checks, log writes, and pacing. The conversation loop adds cascade-abort: 5 consecutive 429s with no successes ends the run cleanly instead of orphaning more empty chats. |
+| `archive.py` | `--archive-only` worker. Renders every conversation as a markdown doc and POSTs to `/api/.../projects/{p}/docs` on a single new project on target. Bypasses `/completion` entirely — finishes in minutes, but chats live inside one Project rather than as Recents entries. |
+| `bookmark.py` | `--bookmark` worker + `claude-migrate load` command. **Bookmark phase**: for each source chat, POST `/chat_conversations` with name `[ul|YYYY-MM-DD] Title`. No project, no `/completion`. `migration_log` row stamped `status='bookmarked'`. **Load phase**: pattern-match bookmarked chats from migration_log (URL paste / full UUID / hex prefix / title substring all supported), render via existing `render.prepare_paste_payload`, paste via existing `transport.send_payload`, rename to default-mode `[YYYY-MM-DD] Title` shape, flip `status='bookmarked'` → `status='ok'`. Refuses to load into a non-empty target chat without `--force`. |
 | `migrate.py` | Top-level orchestrator — `run_restore`, `dry_run_plan`, `migration_status`, `verify_target_conversations`. Uses `open_session`. |
 | `scheduler.py` | Per-OS daily timer install/uninstall (systemd/launchd/Task Scheduler/cron). |
-| `cli.py` | Click commands. Verb-first, positional args. Dry-run default. |
+| `cli.py` | Click commands. Verb-first, positional args. `Proceed? [y/N]` confirm by default; `--dry-run` for preview, `--yes` to skip the prompt. |
 | `errors.py` | Typed exception hierarchy. Catch specifically; never `except Exception`. |
+| `config.py` | Paths (`data_dir`, `config_dir`) + pydantic-settings `Settings` (env vars + `config.toml`). |
 
 ## Rendering mode
 

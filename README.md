@@ -10,6 +10,32 @@ claude-migrate migrate source target         # clone source onto target (asks y/
 
 > **Heads-up:** Anthropic's Consumer Terms forbid scraping (§3.4) and automation (§3.7). This tool exists for migrating between **your own** accounts. You accept the risk that the affected accounts may be rate-limited or suspended. The CLI prompts you to acknowledge this on first run.
 
+## Which migration mode should I use?
+
+There are three. **Pick once before you start** — re-running is idempotent and safe, but switching modes mid-migration produces a target account that's part one mode, part another.
+
+| Your situation | Use this | Why |
+|---|---|---|
+| **Paid plan**, fine waiting hours, want full-fidelity per-chat continuation | **default** (no flag) | One `/completion` per chat, transcript pasted as the first user message. Slow on Pro (~22h for 200 chats), fast on Max. |
+| Any plan, just want a **searchable archive** — don't care about per-chat Recents entries | **`--archive-only`** | Zero `/completion` calls. All transcripts become `.md` files inside one Project on target. 200 chats finishes in minutes. |
+| **Free plan** (or paid + want to control which chats spend tokens), want **per-chat Recents entries**, willing to keep a terminal handy | **`--bookmark`** + `claude-migrate load` | Migration creates empty named stubs in Recents (zero `/completion`). You materialise individual chats on demand from the terminal — one `/completion` per chat *you actually want*. |
+
+```bash
+# default — full transcript pasted into each chat
+claude-migrate migrate source target
+
+# archive-only — one project, all chats as .md docs
+claude-migrate migrate source target --archive-only
+
+# bookmark — empty stubs in Recents, load on demand
+claude-migrate migrate source target --bookmark
+claude-migrate load target "react hooks"      # load by title fragment
+claude-migrate load target                    # interactive picker
+claude-migrate load target --all              # load everything (paces against the bucket)
+```
+
+The three modes are mutually exclusive — you can't combine flags. They're also independent: a `--bookmark` migration produces no Project clutter, `--archive-only` produces no per-chat Recents entries, default mode produces both per-chat Recents AND no Projects.
+
 ---
 
 ## Install
@@ -118,9 +144,12 @@ Profiles are arbitrary strings (`source`, `target`, `work`, `personal-old`, …)
 | Command | What it does |
 |---|---|
 | `claude-migrate backup PROFILE [--full]` | One-shot incremental archive of a profile. Use this if you only want a backup without migrating. |
-| `claude-migrate migrate SOURCE TARGET` | Backs up source, shows the plan, asks `Proceed? [y/N]`, then migrates. Re-running is idempotent — already-migrated objects are skipped via the `migration_log` table. |
+| `claude-migrate migrate SOURCE TARGET` | **Default mode**: backs up source, shows the plan, asks `Proceed? [y/N]`, then pastes each chat as its own conversation on target. Idempotent — already-migrated chats are skipped via the `migration_log` table. |
+| `claude-migrate migrate SOURCE TARGET --archive-only` | **Archive mode**: bundle every conversation as a `.md` doc inside one Project on target. Zero `/completion` calls; finishes in minutes. No per-chat Recents entries. |
+| `claude-migrate migrate SOURCE TARGET --bookmark` | **Bookmark mode**: create empty `[unloaded]`-prefixed stubs in target's Recents — no transcripts pasted, no `/completion` calls. Materialise specific chats on demand with `claude-migrate load`. |
 | `claude-migrate migrate SOURCE TARGET --dry-run` | Plan only — show what would happen, exit without prompting or running. |
 | `claude-migrate migrate SOURCE TARGET --yes` | Skip the y/N prompt (for scripts/automation). Same effect as answering `y`. |
+| `claude-migrate load TARGET [PATTERN]` | Materialise one or more chats created by `--bookmark` mode. With a `PATTERN` it does a case-insensitive substring match against the source title; `>=6 hex chars` is treated as a UUID prefix lookup against the target chat (paste from your URL bar). With no args it shows an interactive numbered picker. With `--all` it loads every bookmarked chat, paced the same way as `migrate`. Idempotent — already-loaded chats are skipped. |
 | `claude-migrate verify TARGET [--reconcile]` | Probe each migrated chat on target to confirm it's still there. `--reconcile` drops `migration_log` rows for chats that have been deleted on the server. |
 | `claude-migrate reorder TARGET` | No-op PUT each migrated chat on target in source's `updated_at` order, so target's Recents matches the source's. No model calls. Confirms before running; pass `--dry-run` for preview or `--yes` to skip the prompt. |
 | `claude-migrate cleanup TARGET --since ISO` | Delete empty (zero-message) chats on target created during a failed run. Each candidate is verified to have zero messages before deletion — real chats are never touched. Confirms before running; `--dry-run` / `--yes` available. |
@@ -225,6 +254,16 @@ Two further wrinkles:
    ```bash
    claude-migrate migrate source target --archive-only
    ```
+3. **`--bookmark` + `claude-migrate load`.** Migration creates empty named stubs in Recents — no `/completion` calls during migrate, no project clutter, finishes in minutes. Each stub is titled `[ul|YYYY-MM-DD] Original title` (the `ul` token signals "unloaded — don't type yet"). To resume one, run `claude-migrate load target "<title fragment>"` — it pastes the transcript via `/completion` and renames the chat to the default-mode `[YYYY-MM-DD] Title` shape. Per-chat token cost is identical to default mode, but **you only pay it on the chats you actually want**. Ideal when most of your archive is "just in case I want to look at it" rather than "I'll definitely use this."
+   ```bash
+   claude-migrate migrate source target --bookmark
+   # later, when you want to resume one of them:
+   claude-migrate load target "react hooks"
+   # or pick from a list:
+   claude-migrate load target
+   # or load everything (paces against the bucket the same way `migrate` does):
+   claude-migrate load target --all
+   ```
 3. **`--fast` flag.** Shortcut for `--concurrency=3`. On accounts with slack in the bucket, runs three conversations in parallel. Auto-reorder runs at the end so Recents matches source `updated_at` ordering.
    ```bash
    claude-migrate migrate source target --fast
@@ -235,15 +274,56 @@ Two further wrinkles:
 ### What the tool already does for you
 
 - **Adaptive pacing (AIMD)**: starts at 5s/chat, doubles on 429, divides by 1.5 after 3 consecutive successes. Adapts to your account's actual rate, not a fixed conservative default.
-- **Honors server-side `Retry-After`**: when claude.ai sends a header telling us how long to wait, we wait that long instead of a hardcoded 300s cooldown.
+- **Honors server-side `Retry-After`**: when claude.ai sends a header telling us how long to wait, we wait that long instead of a hardcoded 300s cooldown. A hard 10s floor is enforced regardless — Anthropic occasionally sends `Retry-After: 0`, which would otherwise become a tight retry loop.
 - **Drops wasted client-side retries on 429**: the conversation-restore loop's outer cooldown is the right place to retry; inner retries inside the SSE handshake just burn ~14s of extra sleep.
-- **Empirical instrumentation**: each 429 is logged with the response headers so you can verify what the server is sending. If `retry_after_header` shows a value, the Pacer respects it.
+- **Cascade-abort**: if 5 chats in a row hit a rate limit with no successes in between, the migration stops cleanly instead of grinding through every remaining chat creating orphan empty stubs on target. The summary explains the recovery options (`--archive-only`, wait, or `cleanup`).
+- **Empirical instrumentation**: each 429 is logged with the response headers (`Retry-After`, `anthropic-ratelimit-*`) so you can verify what the server is sending.
 
 ### What `--archive-only` looks like on target
 
 After running it, the target account has one new project named `[archive] {source-email} {YYYY-MM-DD}`. Inside, every source conversation is a `.md` file with the full transcript. Open the project and ask "what did I discuss about X?" — Claude searches the docs.
 
 This is **functionally equivalent to a backup-and-search use case** for many users. If you don't actually need each chat as its own entry in Recents (most don't, especially for chats older than a few weeks), `--archive-only` is the right choice.
+
+### What `--bookmark` looks like on target
+
+After running it, the target account has one empty chat in Recents per source chat, each titled `[ul|YYYY-MM-DD] Original title`. No projects, no transcripts pasted, zero `/completion` calls. The `[ul|...]` prefix is the in-UI signal that the chat is an unloaded stub — **don't type in it before running `load`** (your message would land before the transcript paste, producing an awkward chat history).
+
+To resume a chat, run any of these:
+
+```bash
+# By title fragment (case-insensitive substring):
+claude-migrate load target "react hooks"
+
+# By full URL — paste straight from your browser bar:
+claude-migrate load target https://claude.ai/chat/abc12345-...-...
+
+# By bare full UUID:
+claude-migrate load target abc12345-1234-5678-90ab-cdef12345678
+
+# By UUID prefix (≥6 hex chars):
+claude-migrate load target abc12345
+
+# Interactive picker over every bookmarked chat:
+claude-migrate load target
+
+# Load every bookmark in one go (paces against the bucket the same way migrate does):
+claude-migrate load target --all
+```
+
+Tab completion on bookmark titles works the same way profile-name completion does — wire your shell once (see the **Tab-completion of profile names** section above) and `claude-migrate load jamie cre<Tab>` expands to "Creating a memeable...", etc.
+
+`load` pastes the transcript via `/completion` (one call per chat — same per-chat cost as default mode), strips the `[unloaded]` prefix, and flips the `migration_log` row from `bookmarked` to `ok`. Re-running is idempotent.
+
+If you accidentally typed in an `[unloaded]` chat before loading it, `load` refuses by default — pass `--force` to override. If you deleted a bookmark from claude.ai's UI, `load` surfaces a clean error pointing at `verify --reconcile`.
+
+### Mode safety
+
+The three modes share `migration_log` for idempotency, so they cooperate sensibly:
+
+- **Re-running the same mode** is always safe — already-done items are skipped.
+- **Switching modes** is allowed but doesn't retroactively re-organise. If you ran `--bookmark` and now want default mode for one chat, run `claude-migrate load <target> "<title>"` — that's the right tool. Default-mode `migrate` will skip every already-bookmarked chat and only process new ones.
+- **`cleanup --since`** refuses to delete any chat in `migration_log` regardless of mode — bookmarked stubs are protected from a stray `--since` window the same way loaded chats are.
 
 ---
 
@@ -316,7 +396,7 @@ The CLI strips these before format validation, so you don't have to think about 
 |---|---|---|
 | `401` | "Your sessionKey was not accepted (HTTP 401)…" | Re-copy `sessionKey` (most common cause: truncation) |
 | `403` + Cloudflare HTML | "Cloudflare is challenging the request…" | Refresh `claude.ai` once in your browser to get a fresh `cf_clearance`, re-paste cf_clearance only |
-| `403` no body | "Cloudflare blocked the TLS fingerprint…" | `pip install -U curl_cffi` and retry |
+| `403` no body | "403 without a Cloudflare challenge…" | Cookies are fresh (you just pasted them), so this is most likely an outdated TLS fingerprint: `pip install -U curl_cffi` and retry. If that doesn't help, your IP may be flagged — try from a different network. |
 | network | "Network error while probing claude.ai…" | Check VPN/proxy/connection |
 
 ---
@@ -350,13 +430,14 @@ When `sessionKey` eventually expires, the timer fires, hits 401, exits 75, and w
 |---|---|---|
 | `add` says "looks too short" | DevTools Value column truncates the display | Click the row, copy from the details panel below the table |
 | `add` says "Cloudflare is challenging the request" | Stale `cf_clearance` | Refresh `claude.ai` in your browser, then `claude-migrate add <profile>` and re-paste |
-| `add` says "TLS fingerprint reject" | curl_cffi out of date | `pip install -U curl_cffi`, retry |
-| Restore is hitting 429 every chat | Per-account rate limit on `/completion` | Default 90s/chat keeps most accounts under the limit. Override: `export CLAUDE_MIGRATE_CHAT_SLEEP_SEC=120`. The CLI auto-cools-down on 429 (capped exponential up to 600s). |
+| `add` says "403 without a Cloudflare challenge" | Stale session cookie (usually) or out-of-date TLS fingerprint (rare) | First try re-pasting cookies: `claude-migrate add <profile>`. If multiple profiles fail the same way: `pip install -U curl_cffi`. |
+| Migration is hitting 429 on every chat | Per-account `/completion` rate limit (drained for the current 5-hour window) | Migration aborts after 5 consecutive cascading 429s. Either wait several hours and re-run (idempotent), or switch to `--archive-only` (skips `/completion` entirely). See **Tuning the migration speed** above. |
+| Migration is slow (each chat takes a minute) | Pacer is in conservative mode after past 429s | The Pacer adapts within `[5s, chat_sleep_sec]` using AIMD. Lower the ceiling: `export CLAUDE_MIGRATE_CHAT_SLEEP_SEC=15`. Conversely, raise it on accounts that 429 often: `=60`. |
 | `migrate` fails with HTTP 400/422 | `anthropic-client-sha` rotated | `claude-migrate headers-help` for the capture walkthrough; `claude-migrate config edit` to put the new values in `config.toml` |
-| Restore was interrupted; what's left? | — | `claude-migrate status target` reads `migration_log` (no network) and prints done/total per object type plus recent failures |
-| Failed restore left empty conversations on target | Worker died mid-flight | Find the timestamp of the failed run, then `claude-migrate cleanup target --since 2026-04-30T14:37 --execute`. Each candidate is verified to have zero messages before deletion. |
-| Recents on target are in wrong order | Concurrency > 1 scrambled the migration order | `claude-migrate reorder target --execute` walks source archive in `updated_at ASC` order and bumps each chat's `updated_at` on target |
-| Daily timer fires but does nothing | `sessionKey` expired | Check `data/logs/backup.log`. If it shows 401, run `claude-migrate add source` |
+| Migration was interrupted; what's left? | — | `claude-migrate status <target>` reads `migration_log` (no network) and prints done/total per object type plus recent failures |
+| Failed migration left empty conversations on target | Worker died mid-flight, or cascade-abort tripped | `claude-migrate cleanup <target> --since 2026-04-30T14:37`. Each candidate is verified to have zero messages before deletion. Asks `Proceed? [y/N]` before deleting; pass `--dry-run` to preview. |
+| Recents on target are in wrong order | Concurrency > 1 scrambled the migration order | `claude-migrate reorder <target>` walks the source archive in `updated_at ASC` order and bumps each chat's `updated_at` on target. Confirms before running; `--dry-run` previews. |
+| Daily timer fires but does nothing | `sessionKey` expired | Check `data/logs/backup.log`. If it shows 401, run `claude-migrate add <source>` |
 
 ---
 
@@ -376,6 +457,7 @@ When `sessionKey` eventually expires, the timer fires, hits 401, exits 75, and w
 claude_migrate/
 ├── auth.py        # cookie paste flow, normalization, format validation, keyring storage
 ├── client.py      # one HTTP layer, retry/backoff, 429 cooldown, typed errors
+├── config.py      # paths + pydantic-settings (env vars, config.toml)
 ├── session.py     # `open_session(profile)` — load profile + create client + bind org_uuid
 ├── discover.py    # /api/bootstrap → org_uuid (no side effects)
 ├── fetch.py       # async fan-out: orgs → projects → docs → conversations
@@ -383,8 +465,10 @@ claude_migrate/
 ├── transport.py   # /completion SSE + multipart upload + send_payload dispatch
 ├── store.py       # SQLite schema + UPSERTs + raw-sidecar writer
 ├── state.py       # RestoreState — owns migration_log per (conn, target_profile)
-├── runner.py      # WorkerOutcome + Pacer (rate-limit barrier) + migrate_row helper
-├── restore.py     # Per-object-type restore loops on top of runner + state
+├── runner.py      # WorkerOutcome + Pacer (AIMD rate-limit barrier) + migrate_row helper
+├── restore.py     # Per-object-type restore loops + cascade-abort on top of runner/state
+├── archive.py     # `--archive-only` worker: bundle conversations as docs in one Project
+├── bookmark.py    # `--bookmark` worker + `claude-migrate load` materialiser
 ├── migrate.py     # Top-level orchestrator (run_restore, dry_run_plan, verify_target_conversations)
 ├── memory.py      # Extraction prompt + clipboard helper
 ├── notify.py      # ntfy / osascript / Windows toast on failures
@@ -402,12 +486,12 @@ claude_migrate/
 git clone https://github.com/jamcas14/claude-migrate.git
 cd claude-migrate
 uv sync --all-extras
-uv run pytest              # 280+ tests
+uv run pytest              # ~290 tests
 uv run mypy claude_migrate # strict mode
 uv run ruff check
 ```
 
-The test suite covers auth normalization (every common paste mistake), the HTTP layer's status-code → typed-error mapping, transcript rendering (thinking summaries, tool-call placeholders, citations, files, project context), the restore-state log projection, the rate-limit pacer (cooldown floor, AIMD growth/decay, cascade-abort detection, parallel safety), and the per-payload wire format on the way to `/completion`.
+The test suite covers auth normalization (every common paste mistake), the HTTP layer's status-code → typed-error mapping, `Retry-After` parsing, transcript rendering (thinking summaries, tool-call placeholders, citations, files, project context), the restore-state log projection, the rate-limit pacer (server-hint cooldown floor, AIMD growth/decay, cascade-abort detection, parallel safety), the archive-only worker, and the per-payload wire format on the way to `/completion`.
 
 ---
 

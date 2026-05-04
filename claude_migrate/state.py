@@ -63,6 +63,21 @@ class RestoreState:
                 error=error,
             )
 
+    def mark_bookmarked(self, *, source_uuid: str, target_uuid: str) -> None:
+        """Record a `--bookmark`-mode stub: empty target chat created, the
+        transcript has not been pasted yet. `claude-migrate load` later
+        flips status='bookmarked' → status='ok' once the paste lands.
+        """
+        with transaction(self.conn):
+            log_migration(
+                self.conn,
+                source_uuid=source_uuid,
+                object_type="conversation",
+                target_profile=self.target_profile,
+                target_uuid=target_uuid,
+                status="bookmarked",
+            )
+
     def drop(self, source_uuid: str) -> None:
         """Delete a row so the next restore re-attempts the object.
 
@@ -79,6 +94,20 @@ class RestoreState:
 
     def already_migrated(self, source_uuid: str) -> str | None:
         return already_migrated(self.conn, source_uuid, self.target_profile)
+
+    def already_bookmarked(self, source_uuid: str) -> str | None:
+        """target_uuid for a `status='bookmarked'` row, else None.
+
+        Used by the bookmark orchestrator to skip source chats that already
+        have an empty stub on target — preventing duplicate stubs across
+        re-runs of `migrate ... --bookmark`.
+        """
+        row = self.conn.execute(
+            "SELECT target_uuid FROM migration_log "
+            "WHERE source_uuid=? AND target_profile=? AND status='bookmarked'",
+            (source_uuid, self.target_profile),
+        ).fetchone()
+        return None if row is None else row["target_uuid"]
 
     # -- aggregate reads -------------------------------------------------
 
@@ -155,3 +184,42 @@ class RestoreState:
             (self.target_profile,),
         ).fetchall()
         return [(r["source_uuid"], r["target_uuid"]) for r in rows]
+
+    def bookmarked_conversations(self) -> list[tuple[str, str]]:
+        """(source_uuid, target_uuid) for every conversation in
+        `--bookmark` state — empty stub on target, transcript not yet pasted.
+        Drives the load-command picker.
+        """
+        rows = self.conn.execute(
+            "SELECT source_uuid, target_uuid FROM migration_log "
+            "WHERE target_profile=? AND object_type='conversation' "
+            "AND status='bookmarked' AND target_uuid IS NOT NULL",
+            (self.target_profile,),
+        ).fetchall()
+        return [(r["source_uuid"], r["target_uuid"]) for r in rows]
+
+    def bookmarked_count(self) -> int:
+        """Count of conversations in `--bookmark` state. Cheaper than
+        `len(bookmarked_conversations())` for the `status` summary path."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM migration_log "
+            "WHERE target_profile=? AND object_type='conversation' "
+            "AND status='bookmarked' AND target_uuid IS NOT NULL",
+            (self.target_profile,),
+        ).fetchone()
+        return int(row[0])
+
+    def all_migrated_target_uuids(self) -> set[str]:
+        """target_uuids for every conversation we own on target — loaded or
+        bookmarked. Used by `cleanup` to refuse deletion of any chat the
+        tool created. Without this filter, a wide --since window covering
+        a successful `--bookmark` run would happily delete every empty stub.
+        """
+        rows = self.conn.execute(
+            "SELECT target_uuid FROM migration_log "
+            "WHERE target_profile=? AND object_type='conversation' "
+            "AND status IN ('ok', 'bookmarked') "
+            "AND target_uuid IS NOT NULL",
+            (self.target_profile,),
+        ).fetchall()
+        return {r["target_uuid"] for r in rows}

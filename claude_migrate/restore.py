@@ -50,6 +50,11 @@ class RestoreSummary:
     conversations_total: int = 0
     conversations_migrated: int = 0
     skipped: int = 0
+    skipped_bookmarked: int = 0
+    """Default-mode chats that already have a `--bookmark`-mode stub on
+    target. The default loop refuses to create a duplicate; the user is
+    expected to run `claude-migrate load` to materialise these instead.
+    Surfaced separately so the CLI summary can point at the right command."""
     failed: list[tuple[str, str]] = field(default_factory=list)
     dry_run: bool = False
     cascade_aborted: bool = False
@@ -281,6 +286,7 @@ async def find_orphan_conversations(
     created_after: datetime,
     created_before: datetime,
     require_empty_name: bool = False,
+    protected_uuids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Find restore-orphan conversations on target.
 
@@ -291,9 +297,16 @@ async def find_orphan_conversations(
 
     `require_empty_name=True` adds a pre-filter for `name == ""` to skip the
     expensive per-conv fetch when the orphans are known to be unnamed.
+
+    `protected_uuids`: target chat UUIDs that must NOT be classified as
+    orphans regardless of message count. Lazy-load chats are intentionally
+    empty (the transcript is in their parent project's knowledge, not in
+    chat history); without this filter, a `cleanup --since` covering a
+    successful lazy-load run would happily delete every migrated chat.
     """
     cursor: str | None = None
     candidates: list[dict[str, Any]] = []
+    protected = protected_uuids or set()
     while True:
         params: dict[str, Any] = {"limit": 100}
         if cursor:
@@ -310,6 +323,10 @@ async def find_orphan_conversations(
             ca = c.get("created_at") or ""
             page_oldest = ca if not page_oldest or ca < page_oldest else page_oldest
             if require_empty_name and c.get("name"):
+                continue
+            cu = c.get("uuid")
+            if isinstance(cu, str) and cu in protected:
+                # Migration-log says we own this — skip even if zero-message.
                 continue
             try:
                 ca_dt = datetime.fromisoformat(ca)
@@ -639,6 +656,29 @@ async def restore_all_conversations(
     async def one(idx: int, row: sqlite3.Row) -> None:
         source_uuid = row["uuid"]
         title = (row["title"] or "(untitled)")[:60]
+
+        # Default-mode + bookmarked stub = collision. The user already has
+        # an empty `[unloaded]` chat on target for this source — creating
+        # ANOTHER target chat here would leave the user with two chats per
+        # source, neither of which they want. Skip with a loud warning;
+        # they should run `claude-migrate load` to materialise the existing
+        # stub instead.
+        bookmarked_target = state.already_bookmarked(source_uuid)
+        if bookmarked_target is not None:
+            summary.skipped_bookmarked += 1
+            log.warning(
+                "conv_migrate_skip_bookmarked",
+                progress=f"{idx + 1}/{total}",
+                source=source_uuid[:8],
+                bookmarked_target=bookmarked_target[:8],
+                title=title,
+                hint=(
+                    "default-mode migrate refuses to duplicate a "
+                    "--bookmark stub. Run `claude-migrate load <target>` "
+                    "to materialise the existing empty chat instead."
+                ),
+            )
+            return
 
         async def work() -> WorkerOutcome:
             return await restore_conversation(

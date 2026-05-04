@@ -81,7 +81,9 @@ class RateLimited(ClaudeMigrateError):
 
 
 class SchemaDrift(ClaudeMigrateError):
-    """Pydantic validation against an API response failed."""
+    """An API response was missing a field the tool relies on, or returned
+    a field with a shape we don't know how to parse. Usually means Anthropic
+    shipped a server-side change; the tool needs updating to match."""
 
     code = "schema_drift"
 

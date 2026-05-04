@@ -69,6 +69,81 @@ async def test_restore_profile_prefs_swallows_recoverable_errors(
     assert result is False  # logged + skipped, no raise
 
 
+async def test_restore_all_conversations_skips_bookmarked_chats(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default-mode `migrate` after a `--bookmark` run must NOT create a
+    second target chat for sources that already have an `[unloaded]` stub.
+    Otherwise the user ends up with two chats per source (one empty bookmark,
+    one loaded duplicate). Skip with `summary.skipped_bookmarked` set, never
+    invoke restore_conversation for those rows."""
+    from claude_migrate.client import Credentials
+    from claude_migrate.config import load_settings
+    from claude_migrate.restore import RestoreSummary, restore_all_conversations
+    from claude_migrate.store import upsert_conversation
+
+    upsert_conversation(db_conn, "o1", {
+        "uuid": "src-bookmarked", "name": "Already a stub",
+        "created_at": "2026-03-15T12:00:00Z",
+        "updated_at": "2026-03-16T12:00:00Z",
+    })
+    upsert_conversation(db_conn, "o1", {
+        "uuid": "src-fresh", "name": "Should migrate normally",
+        "created_at": "2026-03-15T13:00:00Z",
+        "updated_at": "2026-03-15T13:00:00Z",
+    })
+
+    state = RestoreState(db_conn, "tgt")
+    state.mark_bookmarked(source_uuid="src-bookmarked", target_uuid="tgt-bookmark")
+
+    summary = RestoreSummary()
+
+    import claude_migrate.restore as restore_mod
+
+    class _NopPacer:
+        def __init__(self, **kw: object) -> None:
+            self.consecutive_rate_limits = 0
+
+        async def before(self) -> None:
+            return None
+
+        async def after(self, outcome: object) -> None:
+            return None
+
+    monkeypatch.setattr(restore_mod, "Pacer", _NopPacer)
+
+    seen_sources: list[str] = []
+
+    async def fake_restore_conversation(
+        client: object, conn: object, target_org: object,
+        source_conv: object, project_map: object,
+    ) -> object:
+        from claude_migrate.runner import WorkerOutcome
+        seen_sources.append(source_conv["uuid"])  # type: ignore[index]
+        return WorkerOutcome.ok(f"new-target-{source_conv['uuid']}")  # type: ignore[index]
+
+    monkeypatch.setattr(
+        restore_mod, "restore_conversation", fake_restore_conversation,
+    )
+
+    from claude_migrate.client import ClaudeClient
+    client = ClaudeClient(
+        Credentials(session_key="sk-ant-sid01-X", cf_clearance="cf-X"),
+        load_settings(),
+    )
+
+    await restore_all_conversations(
+        client, db_conn, "tgt-org", state, project_map={},
+        dry_run=False, summary=summary, concurrency=1,
+    )
+
+    # restore_conversation MUST have been called for src-fresh ONLY.
+    # src-bookmarked must be skipped via the bookmark guard before any work runs.
+    assert seen_sources == ["src-fresh"], seen_sources
+    assert summary.conversations_migrated == 1
+    assert summary.skipped_bookmarked == 1
+
+
 async def test_restore_all_conversations_cascade_aborts_on_repeated_429(
     db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

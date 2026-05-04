@@ -623,9 +623,11 @@ async def run_auth_flow(profile_name: str, *, refreshing: bool = False) -> Profi
         ) from e
     except TLSReject as e:
         raise AuthInvalid(
-            "Cloudflare blocked the TLS fingerprint. Try `pip install -U curl_cffi`. "
-            "If that doesn't help, file a GitHub issue — Anthropic may have updated bot "
-            "detection."
+            "claude.ai returned 403 without a Cloudflare challenge. The cookies "
+            "you just pasted are fresh, so the most likely cause is an outdated "
+            "TLS fingerprint: `pip install -U curl_cffi` and retry. If that "
+            "doesn't help, your IP may be flagged — try from a different network, "
+            "or file a GitHub issue if the problem persists."
         ) from e
     except NetworkError as e:
         raise AuthInvalid(

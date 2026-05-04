@@ -30,6 +30,14 @@ from .auth import (
     validate_profile_name,
     verify_profile,
 )
+from .bookmark import (
+    BookmarkSummary,
+    LoadCandidate,
+    _filter_candidates,
+    list_bookmarked,
+    load_bookmarks,
+    restore_bookmarks,
+)
 from .config import (
     ANTHROPIC_CLIENT_VERSION_DEFAULT,
     config_dir,
@@ -105,6 +113,34 @@ def _complete_profile_name(
     except Exception:
         # Never let completion errors break the shell. Return empty on any failure.
         return []
+
+
+def _complete_bookmark_pattern(
+    ctx: click.Context, param: click.Parameter, incomplete: str,
+) -> list[str]:
+    """Click shell-completion callback for `claude-migrate load TARGET <pat>`.
+
+    Returns titles of bookmarked chats matching `incomplete` as a case-
+    insensitive substring. Reads `migration_log` for the target profile in
+    ctx.params (no network). Falls back to empty on any error so a broken
+    keychain or stale DB never breaks the user's shell.
+    """
+    target = ctx.params.get("target")
+    if not target:
+        return []
+    try:
+        candidates = list_bookmarked(target)
+    except Exception:
+        return []
+    needle = incomplete.lower()
+    # Match by title substring (the common case) AND by UUID prefix (if the
+    # user pasted from URL / clipboard). Either match returns the title —
+    # shells expect strings, not UUIDs, so we surface the human label.
+    out: list[str] = []
+    for c in candidates:
+        if needle in c.title.lower() or c.target_uuid.lower().startswith(needle):
+            out.append(c.title)
+    return out
 
 
 def _maybe_warn_peak_hours() -> None:
@@ -193,9 +229,10 @@ CONFIG_TEMPLATE = """\
 # anonymous_id   = ""    # optional, anthropic-anonymous-id (claudeai.v1.<uuid>)
 # device_id      = ""    # optional, anthropic-device-id
 
-# Per-chat sleep during restore. Default 90s keeps most accounts under the
-# /completion rate limit. Lower values are faster but more likely to 429.
-# chat_sleep_sec = 90.0
+# Per-chat sleep ceiling during migration. The Pacer's AIMD controller starts
+# at 5s and only ramps up toward this value when 429s appear, so this is the
+# *upper bound* — accounts that don't hit the limit stay near 5s/chat.
+# chat_sleep_sec = 30.0
 """
 
 
@@ -603,6 +640,12 @@ def backup(ctx: click.Context, profile: str, mode: str, tos_ack: bool) -> None:
               "Finishes in minutes (not hours), but chats live in one Project "
               "instead of as individual entries in Recents. Trade-off: lose "
               "per-chat continuation; gain ~150x speedup. No /completion calls.")
+@click.option("--bookmark", is_flag=True,
+              help="Create empty named chats in TARGET's Recents — no transcripts "
+              "pasted, no projects, zero /completion calls. Each chat is a "
+              "stub titled `[ul|YYYY-MM-DD] Original title`. Materialise "
+              "any of them later with `claude-migrate load TARGET PATTERN`. "
+              "Mutually exclusive with --archive-only.")
 @click.option("--skip-backup", is_flag=True,
               help="Skip the source backup step (use existing local archive).")
 @click.option("--skip-reorder", is_flag=True,
@@ -621,6 +664,7 @@ def migrate(
     concurrency: int,
     fast: bool,
     archive_only: bool,
+    bookmark: bool,
     skip_backup: bool,
     skip_reorder: bool,
     tos_ack: bool,
@@ -631,6 +675,18 @@ def migrate(
     prompting; `--yes` skips the prompt for automation."""
     _ensure_tos(tos_ack)
     ensure_data_dir()
+
+    if archive_only and bookmark:
+        click.echo(
+            "\n--archive-only and --bookmark are mutually exclusive — they're "
+            "two different zero-/completion strategies.\n"
+            "  → --archive-only: one project, all transcripts as docs, no "
+            "per-chat Recents entries.\n"
+            "  → --bookmark:     empty named chats in Recents, transcripts loaded "
+            "on demand via `claude-migrate load`.\n",
+            err=True,
+        )
+        sys.exit(2)
 
     # --fast is shorthand for --concurrency=3. If both are set, --concurrency wins.
     if fast and concurrency == 1:
@@ -699,10 +755,23 @@ def migrate(
     # B10: realistic-expectation banner. Print only when conversations are
     # actually being migrated and there's a non-trivial number — the
     # Pro-plan 45-msg/5h wall is the dominant factor, and most users don't
-    # know it exists. Skip for archive-only mode (separate path, no /completion).
-    if conversations and not archive_only and plan["conversations_pending"] > 5:
+    # know it exists. Skip for archive-only and bookmark (separate paths,
+    # no /completion at migration time).
+    if (
+        conversations and not archive_only and not bookmark
+        and plan["conversations_pending"] > 5
+    ):
         click.echo("")
         _print_duration_estimate(plan["conversations_pending"], concurrency)
+
+    if bookmark and conversations and plan["conversations_pending"] > 0:
+        click.echo("")
+        click.echo(
+            f"--bookmark set: creating {plan['conversations_pending']} empty "
+            f"named chat(s) in {target}'s Recents — no transcripts pasted, no "
+            f"/completion calls. Materialise any of them later with "
+            f"`claude-migrate load {target} <pattern>`."
+        )
 
     if dry_run:
         click.echo("\n(dry-run — no changes made)")
@@ -751,6 +820,73 @@ def migrate(
         )
         return
 
+    # Bookmark mode. Creates empty named chats in target's Recents — no
+    # transcripts, no projects, no /completion calls. The user can later
+    # `claude-migrate load TARGET <pattern>` to paste a transcript into a
+    # bookmarked chat on demand. Non-conversational phases (prefs / styles /
+    # source-projects) run normally via run_restore.
+    if bookmark:
+        if not skip_prompt and not click.confirm("Proceed?", default=False):
+            click.echo("Aborted.")
+            return
+        non_conv_summary = _run(run_restore(
+            target_profile=target,
+            dry_run=False,
+            do_prefs=prefs,
+            do_styles=styles,
+            do_projects=projects,
+            do_conversations=False,
+            concurrency=concurrency,
+        ))
+        bookmark_summary = _run(_bookmark_run(target, do_conversations=conversations))
+        click.echo("\nDone.")
+        if prefs:
+            flag = "✓" if non_conv_summary.profile_prefs else "—"
+            click.echo(f"  prefs:                  {flag}")
+        if styles:
+            click.echo(
+                f"  styles migrated:        "
+                f"{non_conv_summary.styles_migrated}/{non_conv_summary.styles_total}"
+            )
+        if projects:
+            click.echo(
+                f"  source projects:        "
+                f"{non_conv_summary.projects_migrated}/{non_conv_summary.projects_total}"
+            )
+        if conversations:
+            click.echo(
+                f"  bookmarks created:      "
+                f"{bookmark_summary.conversations_bookmarked}/"
+                f"{bookmark_summary.conversations_total}"
+            )
+        click.echo(
+            f"  skipped (already done): "
+            f"{non_conv_summary.skipped + bookmark_summary.skipped}"
+        )
+        if bookmark_summary.failures:
+            click.echo(f"\n  failures: {len(bookmark_summary.failures)} — first few:")
+            for src_uuid, err in bookmark_summary.failures[:5]:
+                click.echo(f"    {src_uuid[:8]} → {err}")
+            if bookmark_summary.cascade_aborted:
+                click.echo(
+                    "\n  ⚠ Aborted early after consecutive rate-limits on "
+                    "/chat_conversations. Re-run later (idempotent — already-"
+                    "bookmarked chats are skipped)."
+                )
+            else:
+                click.echo(
+                    f"  Re-run `claude-migrate migrate {source} {target} "
+                    f"--bookmark` to retry."
+                )
+        click.echo(
+            f"\n  → Bookmarked chats appear in {target}'s Recents prefixed "
+            f"with `[unloaded]`. Don't type in one until you've loaded it.\n"
+            f"  → Materialise any of them: `claude-migrate load {target} "
+            f"\"<title fragment>\"` (or run with no pattern for an "
+            f"interactive picker, or `--all` to load every bookmarked chat)."
+        )
+        return
+
     # Probe target identity before any destructive call so the user can catch a
     # "wrong cookies on the target profile" mistake before we mutate.
     async def _confirm_target() -> tuple[str | None, str | None]:
@@ -790,6 +926,11 @@ def migrate(
     if conversations:
         click.echo(f"  conversations migrated: {summary.conversations_migrated}/{summary.conversations_total}")
     click.echo(f"  skipped (already done): {summary.skipped}")
+    if summary.skipped_bookmarked > 0:
+        click.echo(
+            f"  skipped (bookmarked):   {summary.skipped_bookmarked}  "
+            f"→ run `claude-migrate load {target}` to materialise these"
+        )
     failed = summary.failed
     if failed:
         click.echo(f"\n  failures: {len(failed)} — first few:")
@@ -846,6 +987,30 @@ async def _reorder_run(profile: str) -> None:
             click.echo(f"  {missing} source chats had no migration_log entry (skipped)")
         if errors:
             click.echo(f"  errors: {len(errors)}")
+
+
+async def _bookmark_run(
+    profile: str, *, do_conversations: bool = True,
+) -> BookmarkSummary:
+    """Bookmark phase: empty named chats in target's Recents, no transcripts.
+
+    Non-conversational phases (prefs, styles, source-projects) run separately
+    via `run_restore(..., do_conversations=False)`.
+    """
+    summary = BookmarkSummary()
+    if not do_conversations:
+        return summary
+    async with open_session(profile) as session:
+        conn = open_db()
+        try:
+            state = RestoreState(conn, profile)
+            await restore_bookmarks(
+                session.client, conn, session.org_uuid, state,
+                dry_run=False, summary=summary,
+            )
+        finally:
+            conn.close()
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1043,10 +1208,24 @@ def cleanup(
             click.echo(f"  target: {session.email} ({session.org_uuid[:8]}...)")
             click.echo(f"  window: {since_dt.isoformat()} → {until_dt.isoformat()}")
             click.echo("  scanning conversations and verifying each is empty...")
+            # Bookmark stubs are intentionally empty (the transcript hasn't
+            # been pasted yet — `claude-migrate load` materialises them on
+            # demand). Loaded chats are also tracked in migration_log. Pull
+            # every conversation target_uuid we own out of the log so the
+            # orphan finder skips them all — without this filter, a wide
+            # --since window covering a successful run would delete every
+            # migrated chat.
+            conn = open_db()
+            try:
+                state = RestoreState(conn, target)
+                protected = state.all_migrated_target_uuids()
+            finally:
+                conn.close()
             orphans = await find_orphan_conversations(
                 session.client, session.org_uuid,
                 created_after=since_dt, created_before=until_dt,
                 require_empty_name=False,
+                protected_uuids=protected,
             )
             return session.email or "?", session.org_uuid, orphans
 
@@ -1095,6 +1274,176 @@ def cleanup(
     _run(delete())
 
 
+@cli.command(help="Materialise bookmarked chats on TARGET — paste the transcript via /completion.")
+@click.argument("target", callback=_profile_arg_callback, shell_complete=_complete_profile_name)
+@click.argument("pattern", required=False, shell_complete=_complete_bookmark_pattern)
+@click.option("--all", "load_all", is_flag=True,
+              help="Load every bookmarked chat. Bypasses the picker; "
+              "respects the same /completion rate-limit pacing as `migrate`.")
+@click.option("--force", is_flag=True,
+              help="Load even if the target chat already has messages "
+              "(e.g., the user typed before running load). The transcript "
+              "will be appended after the existing messages — usually awkward.")
+@click.option("--yes", "-y", "skip_prompt", is_flag=True,
+              help="Skip the y/N confirmation (for scripts/automation). With "
+              "--all this is recommended; without it, the picker handles confirmation.")
+def load(
+    target: str, pattern: str | None, load_all: bool,
+    force: bool, skip_prompt: bool,
+) -> None:
+    """Materialise one or more chats created by `migrate ... --bookmark`.
+
+    Three selection modes:
+      * `claude-migrate load TARGET PATTERN` — substring match against the
+        source title (case-insensitive). One match → loads it. Multiple
+        matches → numbered picker.
+      * `claude-migrate load TARGET <uuid-prefix>` — exact-match the target
+        chat's UUID prefix (≥6 hex chars, copy from the URL bar in your
+        browser).
+      * `claude-migrate load TARGET --all` — load every bookmarked chat.
+      * `claude-migrate load TARGET` (no args) — interactive picker over
+        every bookmarked chat.
+
+    Per-chat token cost is identical to default-mode `migrate`: one
+    `/completion` per chat with the rendered transcript as the first user
+    message. Idempotent — already-loaded chats are skipped.
+    """
+    candidates = list_bookmarked(target)
+    if not candidates:
+        click.echo(f"No bookmarked chats found for target {target!r}.")
+        click.echo(
+            f"  → Run `claude-migrate migrate <source> {target} --bookmark` "
+            "first to create empty stubs in Recents."
+        )
+        return
+
+    # Resolve what the user wants to load before any network call. This
+    # keeps the confirmation step accurate.
+    selected = _select_load_candidates(
+        candidates, pattern=pattern, load_all=load_all,
+        skip_prompt=skip_prompt,
+    )
+    if not selected:
+        return
+
+    if not skip_prompt and not click.confirm(
+        f"Load {len(selected)} chat(s) into {target}?"
+        + (
+            "\n  (each chat costs one /completion call against the target's "
+            "5-hour bucket)"
+            if len(selected) > 5 else ""
+        ),
+        default=False,
+    ):
+        click.echo("Aborted.")
+        return
+
+    summary = _run(load_bookmarks(target, selected, force=force))
+
+    click.echo("\nDone.")
+    click.echo(f"  matched:   {summary.matched}")
+    click.echo(f"  loaded:    {summary.loaded}")
+    if summary.skipped_already_loaded:
+        click.echo(f"  skipped (already loaded): {summary.skipped_already_loaded}")
+    if summary.skipped_non_empty:
+        click.echo(
+            f"  skipped (chat had messages — pass --force to override): "
+            f"{summary.skipped_non_empty}"
+        )
+    if summary.failures:
+        click.echo(f"\n  failures: {len(summary.failures)} — first few:")
+        for src_uuid, err in summary.failures[:5]:
+            click.echo(f"    {src_uuid[:8]} → {err}")
+
+
+def _select_load_candidates(
+    candidates: list[LoadCandidate],
+    *,
+    pattern: str | None,
+    load_all: bool,
+    skip_prompt: bool,
+) -> list[LoadCandidate]:
+    """Resolve the user's intent (pattern / --all / no-args) into a concrete
+    list of LoadCandidates. Handles the numbered-picker UX inline so the
+    network-side `load_bookmarks` doesn't need to know about stdin.
+    """
+    if load_all:
+        return list(candidates)
+
+    if pattern is not None:
+        matches = _filter_candidates(candidates, pattern=pattern, load_all=False)
+        if not matches:
+            click.echo(f"No bookmarked chats match {pattern!r}.")
+            click.echo("  → `claude-migrate load <target>` for an interactive picker.")
+            return []
+        if len(matches) == 1:
+            return matches
+        if skip_prompt:
+            click.echo(
+                f"Pattern {pattern!r} matched {len(matches)} chats. Re-run "
+                "with a more specific pattern, or omit --yes to use the "
+                "interactive picker."
+            )
+            return []
+        return _interactive_pick(matches)
+
+    # No args, no --all — list everything and pick.
+    if skip_prompt:
+        click.echo(
+            "No pattern given. Re-run with a pattern argument, --all, or "
+            "without --yes to use the interactive picker."
+        )
+        return []
+    return _interactive_pick(candidates)
+
+
+def _interactive_pick(items: list[LoadCandidate]) -> list[LoadCandidate]:
+    """Numbered picker. User can enter a single number, a comma-separated
+    list (`1,3,5`), a range (`1-3`), or `all` to take everything."""
+    if not items:
+        return []
+    click.echo("Bookmarked chats:")
+    for i, c in enumerate(items, 1):
+        title = c.title if len(c.title) <= 60 else c.title[:57] + "…"
+        click.echo(f"  {i:>3}. {title}  ({c.target_uuid[:8]})")
+    click.echo("")
+    raw = click.prompt(
+        "Pick (single number, comma list, range like 1-5, or `all`)",
+        type=str, default="", show_default=False,
+    )
+    raw = raw.strip().lower()
+    if not raw:
+        return []
+    if raw == "all":
+        return list(items)
+    indices: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if "-" in part:
+            try:
+                lo_s, hi_s = part.split("-", 1)
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                click.echo(f"  ✗ bad range: {part!r}")
+                return []
+            if lo > hi:
+                lo, hi = hi, lo
+            indices.update(range(lo, hi + 1))
+        else:
+            try:
+                indices.add(int(part))
+            except ValueError:
+                click.echo(f"  ✗ bad number: {part!r}")
+                return []
+    selected: list[LoadCandidate] = []
+    for i in sorted(indices):
+        if not (1 <= i <= len(items)):
+            click.echo(f"  ✗ out of range: {i} (1-{len(items)})")
+            return []
+        selected.append(items[i - 1])
+    return selected
+
+
 @cli.command(help="Print the transcript that would be sent for a stored conversation.")
 @click.argument("conversation_uuid")
 @click.option("--show-payload", is_flag=True,
@@ -1128,11 +1477,24 @@ def status(target: str) -> None:
     s = migration_status(target)
     archive = s["archive"]
     ok = s["target_ok"]
+    bookmarked = s["target_bookmarked"]
     last = s["last_activity"]
     failures = s["failures"]
     click.echo(f"Migration status for target={target}:")
     click.echo("")
-    click.echo(f"  conversations: {ok['conversations']}/{archive['conversations']} migrated")
+
+    conv_loaded = ok["conversations"]
+    conv_bookmarked = bookmarked["conversations"]
+    conv_total = archive["conversations"]
+    conv_pending = max(0, conv_total - conv_loaded - conv_bookmarked)
+    if conv_bookmarked > 0:
+        click.echo(
+            f"  conversations: {conv_loaded} loaded + {conv_bookmarked} "
+            f"bookmarked / {conv_total} total"
+            + (f" ({conv_pending} not yet migrated)" if conv_pending > 0 else "")
+        )
+    else:
+        click.echo(f"  conversations: {conv_loaded}/{conv_total} migrated")
     click.echo(f"  projects:      {ok['projects']}/{archive['projects']} migrated")
     click.echo(f"  styles:        {ok['styles']}/{archive['styles']} migrated")
     click.echo("")
@@ -1140,6 +1502,7 @@ def status(target: str) -> None:
         click.echo(f"  last activity: {last['migrated_at']} ({last['status']})")
     else:
         click.echo("  last activity: (no migration_log rows yet)")
+
     if failures:
         click.echo("")
         click.echo(f"  recent failures: {len(failures)}")
@@ -1151,24 +1514,36 @@ def status(target: str) -> None:
             f"  → Re-run `claude-migrate migrate <source> {target}` "
             "to retry failed objects."
         )
-    else:
-        all_done = (
-            ok["conversations"] >= archive["conversations"]
-            and ok["projects"] >= archive["projects"]
-            and ok["styles"] >= archive["styles"]
+        return
+
+    click.echo("")
+    if archive["conversations"] == 0:
+        click.echo(
+            "  → Run `claude-migrate backup <source>` to populate the local archive."
         )
-        click.echo("")
-        if all_done and archive["conversations"] > 0:
-            click.echo("  ✓ All caught up.")
-        elif archive["conversations"] == 0:
-            click.echo(
-                "  → Run `claude-migrate backup <source>` to populate the local archive."
-            )
-        else:
-            click.echo(
-                f"  → Run `claude-migrate migrate <source> {target}` "
-                "to migrate remaining items."
-            )
+        return
+
+    fully_caught_up = (
+        conv_loaded + conv_bookmarked >= conv_total
+        and ok["projects"] >= archive["projects"]
+        and ok["styles"] >= archive["styles"]
+    )
+    if fully_caught_up and conv_bookmarked == 0:
+        click.echo("  ✓ All caught up.")
+        return
+
+    if conv_bookmarked > 0:
+        click.echo(
+            f"  → Run `claude-migrate load {target} \"<title fragment>\"` to "
+            f"materialise specific bookmarked chats, or "
+            f"`claude-migrate load {target} --all` to load all "
+            f"{conv_bookmarked} of them (each costs one /completion call)."
+        )
+    if conv_pending > 0 or ok["projects"] < archive["projects"] or ok["styles"] < archive["styles"]:
+        click.echo(
+            f"  → Run `claude-migrate migrate <source> {target}` "
+            "to migrate remaining items."
+        )
 
 
 @cli.command(help="Diagnostic: paths, scheduler backend, headers, profiles.")
