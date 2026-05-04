@@ -144,14 +144,14 @@ def _complete_bookmark_pattern(
 
 
 def _maybe_warn_peak_hours() -> None:
-    """Print a banner if the user is starting a migration during Anthropic's
-    peak window (Mon-Fri 13:00-19:00 UTC). The 5-hour usage bucket drains
+    """Print a banner if the user is starting a migration during claude.ai's
+    peak hours (Mon-Fri 13:00-19:00 UTC). The 5-hour usage bucket drains
     ~2x faster during peak — running off-peak is the cheapest speedup."""
     now = datetime.now(UTC)
     weekday = now.weekday()  # 0 = Monday, 6 = Sunday
     if weekday < 5 and 13 <= now.hour < 19:
         click.echo(
-            "  ⚠ You're running during Anthropic's peak hours "
+            "  ⚠ You're running during claude.ai's peak hours "
             "(Mon-Fri 13:00-19:00 UTC). The 5-hour usage bucket drains "
             "~2x faster now. For maximum throughput, consider running on "
             "a weekend morning UTC.\n",
@@ -160,34 +160,37 @@ def _maybe_warn_peak_hours() -> None:
 
 
 def _print_duration_estimate(pending_chats: int, concurrency: int) -> None:
-    """Pre-flight expectation-setting for `migrate`. Anthropic Pro plans cap
-    /completion at ~45 messages per 5-hour rolling window; with realistic
+    """Pre-flight expectation-setting for `migrate`. claude.ai's Pro plan
+    caps /completion at ~45 messages per 5-hour rolling window; with realistic
     pacing the wall clock is dominated by that bucket, NOT by client-side
     sleeps. Set the user's expectations honestly so they don't silently
     abort after 20 minutes wondering why it's so slow."""
     if pending_chats <= 0:
         return
     pro_per_window = 45
-    # Naive estimate assuming the user is on Pro. Round up to whole windows.
+    # Naive estimate assuming the target is on claude.ai Pro. Round up.
     windows = max(1, (pending_chats + pro_per_window - 1) // pro_per_window)
     hours_min = windows * 5  # 5h per window, hard wall
     click.echo(
         f"  Pending: {pending_chats} chats, concurrency={concurrency}.\n"
-        f"  Anthropic's Pro plan caps /completion at ~45 messages per "
-        f"5-hour rolling window. {pending_chats} chats need ≥{windows} "
-        f"window(s) ≈ {hours_min}+ hours wall-clock.\n"
-        f"  • Max 5x ($100/month) raises the cap to ~225/window — your run "
+        f"  claude.ai's Pro plan caps /completion at ~45 messages per "
+        f"5-hour rolling window. If your target is on Pro, {pending_chats} "
+        f"chats need ≥{windows} window(s) ≈ {hours_min}+ hours wall-clock.\n"
+        f"  • claude.ai Max 5x raises the cap to ~225/window — your run "
         f"would finish in {(pending_chats + 224) // 225} window(s).\n"
-        f"  • `--archive-only` bundles every chat as a markdown doc in one "
-        f"Project on target. No /completion calls; finishes in minutes.\n"
+        f"  • `--archive-only` or `--bookmark` skip /completion entirely "
+        f"at migrate-time; both finish in minutes regardless of plan.\n"
     )
 
 TOS_BANNER = (
-    "Heads up: Anthropic's Consumer Terms (§3.4 prohibits scraping, §3.7\n"
-    "prohibits automation) restrict the kind of API access this tool performs.\n"
-    "By using claude-migrate you accept the risk that Anthropic may rate-limit,\n"
-    "suspend, or terminate the affected accounts. The tool is intended for\n"
-    "migrating between YOUR OWN accounts.\n\n"
+    "claude-migrate is a free, open-source community tool. It is not built,\n"
+    "sponsored, or endorsed by Anthropic.\n"
+    "\n"
+    "Anthropic's Consumer Terms (§3.4 prohibits scraping, §3.7 prohibits\n"
+    "automation) restrict the kind of API access this tool performs. By using\n"
+    "claude-migrate you accept the risk that Anthropic may rate-limit, suspend,\n"
+    "or terminate the affected accounts. The tool is intended for migrating\n"
+    "between YOUR OWN accounts.\n\n"
     "Re-run with --i-understand-tos-risk to proceed.\n"
 )
 
@@ -332,10 +335,10 @@ def _run[T](coro: Coroutine[Any, Any, T]) -> T:
         _emit_error(
             str(e),
             wait_msg,
-            "On Pro accounts the /completion bucket is ~45 messages per 5-hour rolling window.",
-            "Faster paths: `--archive-only` (skip /completion entirely; minutes), "
-            "or upgrade to Max 5x for one window of bulk migration.",
-            "See README 'Tuning' section for the full speed playbook.",
+            "claude.ai's Pro plan caps /completion at ~45 messages per 5-hour window; Max 5x ~225, Max 20x ~900.",
+            "Faster paths: `--archive-only` or `--bookmark` (both skip /completion at migrate-time, finish in minutes), "
+            "or temporarily upgrade your target's claude.ai plan to Max 5x for one window of bulk migration.",
+            "See README 'Migration speed and rate limits' section for the full playbook.",
         )
         _exit(EXIT_TEMPFAIL)
     except EndpointChanged as e:
@@ -696,7 +699,7 @@ def migrate(
             "will be jumbled during migration; auto-reorder fixes it at the end.\n"
         )
 
-    # B9: Off-peak warning. Mon-Fri 13:00-19:00 UTC are Anthropic's peak
+    # Off-peak warning. Mon-Fri 13:00-19:00 UTC are claude.ai's peak
     # hours; the 5-hour usage bucket drains ~2x faster. Warn so the user
     # knows they can save real wall clock by running on a weekend morning.
     _maybe_warn_peak_hours()
